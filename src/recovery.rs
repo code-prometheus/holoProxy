@@ -1,76 +1,74 @@
 /// 判断是否需要在 finish 时注入恢复工具
-/// 返回 None 表示不需要恢复，Some(reason) 表示需要恢复
+/// 用关键词权重打分代替硬匹配：score > 0 → 不恢复，score <= 0 → 恢复
 pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String> {
     // 0. stop_reason == 'length' → 总是需要恢复
     if stop_reason == "length" {
         return Some("stop_reason=length".into());
     }
 
-    // 1. 检测问用户问题
-    let question_patterns = [
-        "你想", "你希望", "你打算", "你需要", "你确认",
-        "请告诉我", "请选择", "请确认", "请问",
-        "Do you want", "Would you like", "Which", "Choose",
-        "你更喜欢", "你的选择", "你决定", "你想用",
-        "你怎么看", "你的意见", "你觉得", "你倾向于",
-    ];
-    for p in &question_patterns {
-        if generated_text.contains(p) { return None; }
+    if generated_text.is_empty() {
+        return Some("empty response".into());
     }
 
-    // 2. 检测任务已完成
-    let completion_keywords = [
-        "全部就绪", "任务完成", "已完成", "工作结束",
-        "所有任务均已完成", "没有更多需要", "无需进一步",
-        "成功完成", "执行完毕", "准备就绪",
-        "All tasks completed", "Task finished", "Done",
-        "✅", "🎉", "✨",
-        "需要做什么调整吗", "还有什么我可以",
-        "请告诉我下一步",
-    ];
-    for kw in &completion_keywords {
-        if generated_text.contains(kw) { return None; }
+    let mut score: i32 = -1; // 默认倾向恢复
+
+    // 加分项（表明不需要恢复）
+    for &(kw, weight) in &[
+        // 问用户问题 → 强信号
+        ("你想", 5), ("你希望", 5), ("你打算", 5), ("你需要", 4), ("你确认", 4),
+        ("请告诉我", 5), ("请选择", 5), ("请确认", 4), ("请问", 4),
+        ("Do you want", 5), ("Would you like", 5), ("你更喜欢", 4), ("你决定", 4),
+        ("你怎么看", 4), ("你的意见", 4), ("你觉得", 4), ("你倾向于", 4),
+        // 任务完成 → 强信号
+        ("全部就绪", 5), ("任务完成", 5), ("已完成", 4), ("工作结束", 4),
+        ("成功完成", 4), ("执行完毕", 4), ("准备就绪", 4),
+        ("All tasks completed", 5), ("✅", 3), ("🎉", 3), ("✨", 2),
+        // session 正常结束标记
+        ("改动总结", 5), ("总结如下", 5), ("以下是总结", 5), ("变更总结", 4),
+        ("本次对话", 3), ("本次会话", 3), ("任务总结", 4), ("工作总结", 4),
+        ("主要变化", 3), ("核心变化", 3), ("改动包括", 3),
+        ("Summary", 4), ("In summary", 5), ("Here's a summary", 5),
+        ("Changes made", 4), ("Key changes", 3),
+        ("完成✅", 4), ("搞定了", 3), ("收工", 3),
+        // 要求手动测试
+        ("手动测试", 4), ("请测试", 4), ("请验证", 3), ("请检查", 3),
+        ("Please test", 4), ("Please verify", 4), ("Please check", 4),
+        ("试一下", 3), ("试试看", 3),
+    ] {
+        if generated_text.contains(kw) {
+            score += weight;
+        }
     }
 
-    // 3. 检测要求手动测试
-    let manual_test_patterns = [
-        "手动测试", "请测试", "请验证", "请检查", "请运行", "请执行",
-        "测试一下", "试一下", "试试看", "你可以测试",
-        "Please test", "Please verify", "Please check",
-        "manually test", "try it", "test it",
-        "运行一下", "执行一下", "检查一下", "验证一下", "确认一下",
-    ];
-    for p in &manual_test_patterns {
-        if generated_text.contains(p) { return None; }
+    // 减分项（说明输出混乱/无意义，更需要恢复）
+    for &(kw, weight) in &[
+        ("[holoProxy Recovery", -3),   // 已经是恢复标记，减分防止循环
+        ("[holoProxy Error", -3),
+    ] {
+        if generated_text.contains(kw) {
+            score += weight;
+        }
     }
 
-    // 4. 检测总结/摘要（session 正常结束）
-    let summary_patterns = [
-        "改动总结", "总结如下", "以下是总结", "变更总结", "修改总结",
-        "本次对话", "本次会话", "本次修改", "本次改动", "本次变更",
-        "完成总结", "任务总结", "工作总结",
-        "主要变化", "核心变化", "改动包括", "做了什么",
-        "以下是本次", "如下所示",
-        "Summary", "In summary", "Here's a summary",
-        "Changes made", "What was changed", "Modified files",
-        "Key changes", "Overview of changes",
-        "完成✅", "搞定了", "收工",
-    ];
-    for p in &summary_patterns {
-        if generated_text.contains(p) { return None; }
+    if score > 0 {
+        return None;
     }
 
-    // 5. 需要恢复
-    Some("no tool_use, no completion flag".into())
+    Some("score <= 0, no completion/question/manual-test/summary flag".into())
 }
 
 /// 动态选取恢复工具：优先 Bash/Shell/RunCommand/Execute
-pub fn pick_recovery_tool(valid_tools: &std::collections::HashMap<String, &crate::types::ToolDef>) -> Option<(String, serde_json::Value)> {
+pub fn pick_recovery_tool(
+    valid_tools: &std::collections::HashMap<String, &crate::types::ToolDef>,
+) -> Option<(String, serde_json::Value)> {
     if valid_tools.is_empty() {
         return None;
     }
 
-    let priority_names = ["Bash", "Shell", "bash", "shell", "Execute", "Run_Command", "RunCommand", "terminal", "Terminal"];
+    let priority_names = [
+        "Bash", "Shell", "bash", "shell",
+        "Execute", "Run_Command", "RunCommand", "terminal", "Terminal",
+    ];
     for name in &priority_names {
         if let Some(tool) = valid_tools.get(*name) {
             return Some((name.to_string(), build_recovery_args(tool)));
@@ -83,7 +81,9 @@ pub fn pick_recovery_tool(valid_tools: &std::collections::HashMap<String, &crate
             .and_then(|p| p.as_object());
         if let Some(props_map) = props {
             if props_map.contains_key("command") {
-                return Some((name.clone(), serde_json::json!({"command": "echo \"Fake tool calling ...\" && pwd && ls -la || cd && dir"})));
+                return Some((name.clone(), serde_json::json!({
+                    "command": "echo \"Fake tool calling ...\" && pwd && ls -la || cd && dir"
+                })));
             }
         }
     }
@@ -145,6 +145,17 @@ mod tests {
     #[test]
     fn test_should_recover_on_bad_output() {
         assert!(should_recover("一些无意义的废话", "stop").is_some());
+    }
+
+    #[test]
+    fn test_should_recover_on_empty() {
+        assert!(should_recover("", "stop").is_some());
+    }
+
+    #[test]
+    fn test_should_not_recover_on_strong_signal() {
+        // 多个强信号叠加 → score 很高 → 不恢复
+        assert!(should_recover("任务完成！你需要什么调整吗？总结如下：全部就绪", "stop").is_none());
     }
 
     #[test]

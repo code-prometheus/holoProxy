@@ -308,17 +308,24 @@ async fn forward_sse(
                     }
                 }
             }
-            Err(_) => { break; }
+            Err(_) => {
+                // SSE 读取出错 → 仍然闭合消息，防止 Claude Code 挂起
+                if has_any_data {
+                    finish_reason = "error".into();
+                }
+                break;
+            }
         }
     }
 
+    // 总是调用 finish 确保消息闭合（即使 has_any_data=false）
     if has_any_data {
         sse_ctx.finish(&finish_reason);
-        for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
-        true
     } else {
-        false
+        sse_ctx.finish("error");
     }
+    for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
+    has_any_data
 }
 
 async fn handle_get_models() -> impl IntoResponse {

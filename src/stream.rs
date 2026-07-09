@@ -372,7 +372,7 @@ impl StreamContext {
                         "=".repeat(40),
                         "=".repeat(40),
                         reason,
-                        &self.generated_text[self.generated_text.len().saturating_sub(400)..],
+                        &self.generated_text[self.generated_text.floor_char_boundary(self.generated_text.len().saturating_sub(400))..],
                         "=".repeat(40)
                     );
                     info!("{}", diag_msg);
