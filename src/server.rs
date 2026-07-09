@@ -106,6 +106,17 @@ async fn handle_messages(
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let _ = tx.send(Bytes::from(": keepalive\n\n")).await;
 
+    // 定期保活：每 15 秒发 keepalive，防止 Claude Code 超时断开
+    let keepalive_tx = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
+                break; // rx 端已关闭，停止保活
+            }
+        }
+    });
+
     let tools_arc = valid_tools_arc.clone();
     let model = llm_config.model_name.clone();
     let mid = msg_id.clone();
