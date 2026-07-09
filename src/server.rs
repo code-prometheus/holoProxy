@@ -19,7 +19,6 @@ use crate::converter::convert_to_openai_req;
 use crate::stream::StreamContext;
 use crate::types::*;
 
-/// 活跃连接跟踪：msg_id → 创建时间
 type ActiveConns = Arc<Mutex<HashMap<String, std::time::Instant>>>;
 
 pub struct AppState {
@@ -31,17 +30,16 @@ pub fn create_router() -> Router {
         active_connections: Arc::new(Mutex::new(HashMap::new())),
     });
 
-    // 启动定时清理任务（每 30s 清理超过 300s 无活动的连接）
     let conns = state.active_connections.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             let mut guard = conns.lock().await;
             let before = guard.len();
             guard.retain(|_id, ts| ts.elapsed() < std::time::Duration::from_secs(300));
-            if guard.len() != before {
-                info!("🧹 [Cleanup] 清理 {} 个超时连接（>300s），剩余 {} 个", before - guard.len(), guard.len());
+            if before != guard.len() {
+                info!("[cleanup] {} stale conns removed (active: {})", before - guard.len(), guard.len());
             }
         }
     });
@@ -58,9 +56,9 @@ async fn handle_messages(
     Json(body): Json<AnthropicRequest>,
 ) -> Response {
     let llm_config = match crate::config::get_active_llm_config() {
-        Some(c) => c.clone(),
+        Some(c) => c,
         None => {
-            error!("无 LLM 配置");
+            error!("No LLM config");
             return (StatusCode::INTERNAL_SERVER_ERROR, "No LLM").into_response();
         }
     };
@@ -71,16 +69,26 @@ async fn handle_messages(
     let valid_tools_arc = Arc::new(valid_tools);
 
     let mut openai_req = convert_to_openai_req(&body, &llm_config);
+
+    // 纯文本清洗（去控制字符 + 压缩空白），后跟 trim 检查
+    crate::context::clean_messages(&mut openai_req.messages);
+
     let max_context = parse_context_length(&llm_config.context_max_length);
     if crate::context::should_trim(&openai_req.messages, max_context) {
         crate::context::trim_messages(&mut openai_req.messages, max_context);
     }
 
-    let req_body_bytes = serde_json::to_vec(&openai_req).map_or(0, |v| v.len());
+    let req_bytes = serde_json::to_vec(&openai_req).map_or(0, |v| v.len());
+    let msg_id = format!("msg_{}", chrono::Utc::now().timestamp());
+    let timeout_secs = calc_timeout_secs(req_bytes);
+
+    // 单行摘要：模型 | 消息条数 | tokens | 上下文大小 | 超时
     info!(
-        "📏 [Context] {:.1}KB | {}条 | ~{}tokens | max={}",
-        req_body_bytes as f64 / 1024.0, openai_req.messages.len(),
-        crate::context::estimate_token_count(&openai_req.messages), max_context
+        "[req {}] {}agent={} msgs={} tok={} max_ctx={} timeout={}s | {}",
+        msg_id, if is_auto_select() { "[AUTO]" } else { "" },
+        is_agent_mode, openai_req.messages.len(),
+        crate::context::estimate_token_count(&openai_req.messages),
+        max_context, timeout_secs, llm_config.model_name
     );
 
     let base_url = llm_config.base_url.trim_end_matches('/');
@@ -89,18 +97,12 @@ async fn handle_messages(
     } else {
         format!("{}/chat/completions", base_url).into()
     };
-    let msg_id = format!("msg_{}", chrono::Utc::now().timestamp());
-    let timeout_secs = calc_timeout_secs(req_body_bytes);
-    info!("⏱️ [Timeout] 请求体{:.1}KB → 动态超时{}s", req_body_bytes as f64/1024.0, timeout_secs);
 
-    // 注册活跃连接
     {
         let mut guard = state.active_connections.lock().await;
         guard.insert(msg_id.clone(), std::time::Instant::now());
-        info!("📊 [ActiveConns] 注册 {} (当前活跃: {})", msg_id, guard.len());
     }
 
-    // ⚡ 强制 SSE 流式：统一走 mpsc channel，先返回 keepalive 防止 Claude Code 60s 超时
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let _ = tx.send(Bytes::from(": keepalive\n\n")).await;
 
@@ -118,7 +120,6 @@ async fn handle_messages(
             &api, &oa_req, &llm_cfg, &mid, &model, is_agent_mode, &tools_arc,
             timeout_secs, &tx, is_auto,
         ).await;
-        // 完成后清理
         conns.lock().await.remove(&mid);
     });
 
@@ -137,7 +138,6 @@ async fn handle_messages(
 
 const MAX_RETRIES: u32 = 10;
 
-/// 带自动 fallback 的后台请求：非自动模式走单 LLM 重试，自动模式失败后依次切换 LLM
 async fn background_request_with_fallback(
     api_url: &str,
     openai_req: &OpenAIRequest,
@@ -150,8 +150,7 @@ async fn background_request_with_fallback(
     tx: &mpsc::Sender<Bytes>,
     is_auto: bool,
 ) {
-    // 尝试当前 LLM
-    let success = try_request(
+    let (success, retries, last_err) = try_request(
         api_url, openai_req, llm_config, msg_id, model_name,
         is_agent_mode, valid_tools, timeout_secs, tx,
     ).await;
@@ -160,21 +159,18 @@ async fn background_request_with_fallback(
         return;
     }
 
-    // 非自动模式：直接返回（已在 try_request 中发过保活）
     if !is_auto {
+        info!("[{}] fail after {} retries: {}", msg_id, retries, last_err);
         send_keepalive_response(msg_id, model_name, is_agent_mode, valid_tools, tx).await;
         return;
     }
 
-    // 自动模式：依次 fallback
-    let _current_llm = llm_config.model_name.clone();
-    let mut fallback_count = 0;
-
+    // 自动 fallback
+    let mut fb_count = 0;
     loop {
-        let next = crate::config::auto_fallback_llm();
-        match next {
-            Some((fallback_name, config)) => {
-                fallback_count += 1;
+        match crate::config::auto_fallback_llm() {
+            Some((name, config)) => {
+                fb_count += 1;
                 let fb_url: Arc<str> = {
                     let base = config.base_url.trim_end_matches('/');
                     if base.ends_with("/chat/completions") {
@@ -183,25 +179,19 @@ async fn background_request_with_fallback(
                         format!("{}/chat/completions", base).into()
                     }
                 };
-                info!(
-                    "🔄 [AutoSelect Fallback #{}/{}] 尝试: '{}' ({})",
-                    fallback_count, fallback_name, fallback_name, config.model_name
-                );
+                info!("[{}] auto-fallback #{}/{} → {} ({})", msg_id, fb_count, name, name, config.model_name);
 
-                let success = try_request(
+                let (ok, _, _) = try_request(
                     &fb_url, openai_req, &config, msg_id, &config.model_name,
                     is_agent_mode, valid_tools, timeout_secs, tx,
                 ).await;
 
-                if success {
+                if ok {
                     return;
                 }
             }
             None => {
-                warn!(
-                    "🚨 [AutoSelect] 所有 LLM (共{}个) 均已尝试失败",
-                    fallback_count + 1
-                );
+                warn!("[{}] all LLMs exhausted after {} fallbacks", msg_id, fb_count);
                 send_keepalive_response(msg_id, model_name, is_agent_mode, valid_tools, tx).await;
                 return;
             }
@@ -209,7 +199,7 @@ async fn background_request_with_fallback(
     }
 }
 
-/// 对单个 LLM 发起请求（含 10 次重试），返回是否成功
+/// 对单个 LLM 请求，含静默重试。返回 (成功, 重试次数, 最后错误)
 async fn try_request(
     api_url: &str,
     openai_req: &OpenAIRequest,
@@ -220,8 +210,9 @@ async fn try_request(
     valid_tools: &Arc<HashMap<String, ToolDef>>,
     timeout_secs: u64,
     tx: &mpsc::Sender<Bytes>,
-) -> bool {
+) -> (bool, u32, String) {
     let client = Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    let mut last_err = String::new();
 
     for attempt in 1..=MAX_RETRIES {
         let mut req = client.post(api_url).json(openai_req)
@@ -239,48 +230,31 @@ async fn try_request(
                     response, msg_id, model_name, is_agent_mode, valid_tools, tx,
                 ).await;
                 if has_output {
-                    return true; // 成功且有效输出
+                    return (true, 0, String::new());
                 }
-                // 200 但无内容 → 算失败，继续重试
-                warn!("⚠️ [holoProxy] LLM 返回空内容，重试...");
-                if attempt < MAX_RETRIES {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                return false;
+                last_err = "empty response".into();
             }
             Ok(Err(e)) => {
-                let err_str = e.to_string();
-                if should_retry_silent(&err_str) && attempt < MAX_RETRIES {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(6)));
-                    info!("🔌 [holoProxy Retry {}/{}] {} → {}s 后静默重试...", attempt, MAX_RETRIES, err_str, delay.as_secs());
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                info!("🔌 [holoProxy Retry {}/{}] 非静默错误，放弃: {}", attempt, MAX_RETRIES, err_str);
-                if attempt < MAX_RETRIES {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                warn!("🚨 [holoProxy] {} 次重试全部失败: {}", MAX_RETRIES, err_str);
-                return false;
+                last_err = e.to_string();
             }
-            Err(_timeout) => {
-                if attempt < MAX_RETRIES {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(6)));
-                    info!("⏰ [holoProxy Timeout {}/{}] {}s → 静默重试...", attempt, MAX_RETRIES, timeout_secs);
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                warn!("🚨 [holoProxy] {} 次超时重试全部失败 ({}s 超时)", MAX_RETRIES, timeout_secs);
-                return false;
+            Err(_) => {
+                last_err = format!("timeout {}s", timeout_secs);
             }
         }
+        // 统一重试：所有错误都重新发起 HTTP 连接
+        if attempt < MAX_RETRIES {
+            if attempt == 1 {
+                info!("[{}] retry {}/{}: {}", msg_id, attempt, MAX_RETRIES, last_err);
+            }
+            let delay = std::time::Duration::from_secs(attempt.min(6) as u64);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
     }
-    false
+    warn!("[{}] {} retries exhausted: {}", msg_id, MAX_RETRIES, last_err);
+    (false, MAX_RETRIES, last_err)
 }
 
-/// 发送一个最小保活的完整 SSE 响应（防止 Claude Code 空响应报错）
 async fn send_keepalive_response(
     msg_id: &str,
     model_name: &str,
@@ -297,14 +271,6 @@ async fn send_keepalive_response(
     }
 }
 
-fn should_retry_silent(err_str: &str) -> bool {
-    err_str.contains("disconnect") || err_str.contains("10054")
-        || err_str.contains("connection reset") || err_str.contains("EOF")
-        || err_str.contains("connection closed") || err_str.contains("timed out")
-        || err_str.contains("timeout")
-}
-
-/// 转发下游 SSE 流，返回是否有有效输出（至少一个 SSE 事件）
 async fn forward_sse(
     response: reqwest::Response,
     msg_id: &str, model_name: &str,
@@ -342,7 +308,7 @@ async fn forward_sse(
                     }
                 }
             }
-            Err(e) => { warn!("SSE read err: {}", e); break; }
+            Err(_) => { break; }
         }
     }
 
@@ -366,7 +332,6 @@ async fn handle_get_models() -> impl IntoResponse {
 async fn handle_select_model(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let name = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
-    // 处理自动选择开关
     if name == "__auto__" || name == "auto" {
         let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
         crate::config::switch_auto_select(enable);

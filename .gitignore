@@ -4,3 +4,6 @@
 Thumbs.db
 .claude/
 Cargo.lock
+*.tar.gz
+*.zip
+release_body.json

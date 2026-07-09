@@ -1,20 +1,10 @@
 use crate::types::*;
-use tracing::info;
 
 const TOOLS_INSTRUCTION: &str = "\n\n[Tools Instruction]\nIf you cannot use Native API function calling, output EXACTLY:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"val\"}}\n</tool_call>";
 
-/// 清洗历史消息中的恢复标记（含压缩前后 log）
+/// 清洗历史消息中的恢复标记
 pub fn clean_recovery_garbage(text: &str) -> String {
     if text.contains("[holoProxy Recovery") {
-        let original_len = text.len();
-        let safe_cut = if original_len > 200 { text.floor_char_boundary(200) } else { original_len };
-        let preview = &text[..safe_cut];
-        info!(
-            "🧹 [Recovery Clean] 压缩恢复标记 | {}→{} chars | 原文预览: {}…",
-            original_len,
-            "(Previous auto-recovery signal omitted to save context)".len(),
-            preview
-        );
         "(Previous auto-recovery signal omitted to save context)".into()
     } else {
         text.into()
