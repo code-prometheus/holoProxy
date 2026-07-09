@@ -1,0 +1,29 @@
+{
+    "active_llm": "DeepSeek V4 pro",
+    "llms": {
+        "DeepSeek V4 pro": {
+            "base_url": "http://122.1.226.2:8000/v1",
+            "model_name": "dsv4",
+            "context_max_length": "1m",
+            "api_key": "none"
+        },
+        "DeepSeek V4 flash": {
+            "base_url": "http://122.1.231.24:8000/v1",
+            "model_name": "dsv4",
+            "context_max_length": "1m",
+            "api_key": "none"
+        },
+        "DeepSeek V4 flash backup": {
+            "base_url": "http://122.1.231.29:8000/v1",
+            "model_name": "dsv4",
+            "context_max_length": "1m",
+            "api_key": "none"
+        },
+        "GLM 5.2": {
+            "base_url": "http://122.1.226.6:8000/v1",
+            "model_name": "glm-52",
+            "context_max_length": "200k",
+            "api_key": "none"
+        }
+    }
+}

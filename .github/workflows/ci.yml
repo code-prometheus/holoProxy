@@ -1,0 +1,51 @@
+name: holoProxy CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          mkdir artifact
+          copy target/release/holo_proxy.exe artifact/
+          mkdir artifact/assets
+          copy assets/icon.ico artifact/assets/
+          copy settings.json artifact/
+          Compress-Archive -Path artifact/* -DestinationPath holoProxy-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: holoProxy-windows-x64
+          path: holoProxy-windows-x64.zip
