@@ -70,5 +70,3 @@ jobs:
         with:
           files: holoProxy-windows-x64.zip
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
