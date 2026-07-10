@@ -69,8 +69,6 @@ async fn handle_messages(
     let valid_tools_arc = Arc::new(valid_tools);
 
     let mut openai_req = convert_to_openai_req(&body, &llm_config);
-
-    // 纯文本清洗（去控制字符 + 压缩空白），后跟 trim 检查
     crate::context::clean_messages(&mut openai_req.messages);
 
     let max_context = parse_context_length(&llm_config.context_max_length);
@@ -82,7 +80,6 @@ async fn handle_messages(
     let msg_id = format!("msg_{}", chrono::Utc::now().timestamp());
     let timeout_secs = calc_timeout_secs(req_bytes);
 
-    // 单行摘要：模型 | 消息条数 | tokens | 上下文大小 | 超时
     info!(
         "[req {}] {}agent={} msgs={} tok={} max_ctx={} timeout={}s | {}",
         msg_id, if is_auto_select() { "[AUTO]" } else { "" },
@@ -104,15 +101,20 @@ async fn handle_messages(
     }
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
-    let _ = tx.send(Bytes::from(": keepalive\n\n")).await;
 
-    // 定期保活：每 15 秒发 keepalive，防止 Claude Code 超时断开
+    // 首 token 到达前每 15s 发 keepalive，首 token 后立即停止
     let keepalive_tx = tx.clone();
+    let (stop_ka_tx, mut stop_ka_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
-                break; // rx 端已关闭，停止保活
+            tokio::select! {
+                _ = &mut stop_ka_rx => break,
+                _ = interval.tick() => {
+                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -129,7 +131,7 @@ async fn handle_messages(
     tokio::spawn(async move {
         background_request_with_fallback(
             &api, &oa_req, &llm_cfg, &mid, &model, is_agent_mode, &tools_arc,
-            timeout_secs, &tx, is_auto,
+            timeout_secs, &tx, is_auto, Some(stop_ka_tx),
         ).await;
         conns.lock().await.remove(&mid);
     });
@@ -150,25 +152,20 @@ async fn handle_messages(
 const MAX_RETRIES: u32 = 10;
 
 async fn background_request_with_fallback(
-    api_url: &str,
-    openai_req: &OpenAIRequest,
+    api_url: &str, openai_req: &OpenAIRequest,
     llm_config: &crate::types::LLMConfig,
-    msg_id: &str,
-    model_name: &str,
-    is_agent_mode: bool,
-    valid_tools: &Arc<HashMap<String, ToolDef>>,
-    timeout_secs: u64,
-    tx: &mpsc::Sender<Bytes>,
-    is_auto: bool,
+    msg_id: &str, model_name: &str,
+    is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
+    timeout_secs: u64, tx: &mpsc::Sender<Bytes>, is_auto: bool,
+    stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
-    let (success, retries, last_err) = try_request(
+    // keepalive 只在初始请求时使用，fallback/重试都不需要
+    let (sk, retries, last_err) = try_request(
         api_url, openai_req, llm_config, msg_id, model_name,
-        is_agent_mode, valid_tools, timeout_secs, tx,
+        is_agent_mode, valid_tools, timeout_secs, tx, stop_keepalive,
     ).await;
 
-    if success {
-        return;
-    }
+    if sk { return; }
 
     if !is_auto {
         info!("[{}] fail after {} retries: {}", msg_id, retries, last_err);
@@ -176,7 +173,6 @@ async fn background_request_with_fallback(
         return;
     }
 
-    // 自动 fallback
     let mut fb_count = 0;
     loop {
         match crate::config::auto_fallback_llm() {
@@ -190,16 +186,13 @@ async fn background_request_with_fallback(
                         format!("{}/chat/completions", base).into()
                     }
                 };
-                info!("[{}] auto-fallback #{}/{} → {} ({})", msg_id, fb_count, name, name, config.model_name);
+                info!("[{}] auto-fallback #{}/{} → {}", msg_id, fb_count, name, config.model_name);
 
                 let (ok, _, _) = try_request(
                     &fb_url, openai_req, &config, msg_id, &config.model_name,
-                    is_agent_mode, valid_tools, timeout_secs, tx,
+                    is_agent_mode, valid_tools, timeout_secs, tx, None,
                 ).await;
-
-                if ok {
-                    return;
-                }
+                if ok { return; }
             }
             None => {
                 warn!("[{}] all LLMs exhausted after {} fallbacks", msg_id, fb_count);
@@ -210,27 +203,21 @@ async fn background_request_with_fallback(
     }
 }
 
-/// 对单个 LLM 请求，含静默重试。返回 (成功, 重试次数, 最后错误)
 async fn try_request(
-    api_url: &str,
-    openai_req: &OpenAIRequest,
+    api_url: &str, openai_req: &OpenAIRequest,
     llm_config: &crate::types::LLMConfig,
-    msg_id: &str,
-    model_name: &str,
-    is_agent_mode: bool,
-    valid_tools: &Arc<HashMap<String, ToolDef>>,
-    timeout_secs: u64,
-    tx: &mpsc::Sender<Bytes>,
+    msg_id: &str, model_name: &str,
+    is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
+    timeout_secs: u64, tx: &mpsc::Sender<Bytes>,
+    mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> (bool, u32, String) {
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_RETRIES {
-        // ⚡ 每次重试创建新的 Client，确保旧 TCP 连接被释放
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(0)  // 禁用连接池，每次新建 TCP
-            .build()
-            .unwrap();
+            .pool_max_idle_per_host(0)
+            .build().unwrap();
 
         let mut req = client.post(api_url).json(openai_req)
             .header("Content-Type", "application/json")
@@ -243,8 +230,10 @@ async fn try_request(
         let send_future = req.send();
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), send_future).await {
             Ok(Ok(response)) => {
+                // 只有初始请求需要 keepalive，重试不需要
+                let ka = if attempt == 1 { stop_keepalive.take() } else { None };
                 let has_output = forward_sse(
-                    response, msg_id, model_name, is_agent_mode, valid_tools, tx,
+                    response, msg_id, model_name, is_agent_mode, valid_tools, tx, ka,
                 ).await;
                 if has_output {
                     return (true, 0, String::new());
@@ -258,7 +247,7 @@ async fn try_request(
                 last_err = format!("timeout {}s", timeout_secs);
             }
         }
-        // drop(client) — Client 销毁时关闭所有连接池中的 TCP 连接
+        // drop(client) 释放 TCP 连接
 
         if attempt < MAX_RETRIES {
             info!("[{}] retry {}/{} after {} ({}s sleep)", msg_id, attempt, MAX_RETRIES, last_err, attempt.min(6));
@@ -272,8 +261,7 @@ async fn try_request(
 }
 
 async fn send_keepalive_response(
-    msg_id: &str,
-    model_name: &str,
+    msg_id: &str, model_name: &str,
     is_agent_mode: bool,
     valid_tools: &Arc<HashMap<String, ToolDef>>,
     tx: &mpsc::Sender<Bytes>,
@@ -282,9 +270,7 @@ async fn send_keepalive_response(
         msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(),
     );
     sse_ctx.fallback_empty_finish();
-    for batch in sse_ctx.take_output() {
-        let _ = tx.send(batch).await;
-    }
+    for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
 }
 
 async fn forward_sse(
@@ -293,6 +279,7 @@ async fn forward_sse(
     is_agent_mode: bool,
     valid_tools: &Arc<HashMap<String, ToolDef>>,
     tx: &mpsc::Sender<Bytes>,
+    mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     use futures_util::StreamExt;
     let req_start = std::time::Instant::now();
@@ -309,6 +296,8 @@ async fn forward_sse(
             Ok(chunk) => {
                 if first_token {
                     first_token = false;
+                    // 首 token 到达，停止 keepalive
+                    if let Some(s) = stop_keepalive.take() { let _ = s.send(()); }
                     info!("[rsp {}] {} first_token in {:.1}s", msg_id, model_name, req_start.elapsed().as_secs_f64());
                 }
                 let text = String::from_utf8_lossy(&chunk);
