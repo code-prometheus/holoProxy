@@ -222,10 +222,16 @@ async fn try_request(
     timeout_secs: u64,
     tx: &mpsc::Sender<Bytes>,
 ) -> (bool, u32, String) {
-    let client = Client::builder().danger_accept_invalid_certs(true).build().unwrap();
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_RETRIES {
+        // ⚡ 每次重试创建新的 Client，确保旧 TCP 连接被释放
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)  // 禁用连接池，每次新建 TCP
+            .build()
+            .unwrap();
+
         let mut req = client.post(api_url).json(openai_req)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
@@ -252,7 +258,8 @@ async fn try_request(
                 last_err = format!("timeout {}s", timeout_secs);
             }
         }
-        // 统一重试：所有错误都重新发起 HTTP 连接
+        // drop(client) — Client 销毁时关闭所有连接池中的 TCP 连接
+
         if attempt < MAX_RETRIES {
             if attempt == 1 {
                 info!("[{}] retry {}/{}: {}", msg_id, attempt, MAX_RETRIES, last_err);
