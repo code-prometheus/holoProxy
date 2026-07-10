@@ -296,62 +296,30 @@ async fn forward_sse(
     );
     let mut finish_reason = String::from("stop");
     let mut has_any_data = false;
-    let mut idle_secs = 0u64;
 
-    loop {
-        // 单次 chunk 30s 超时 + 整体 180s 超时
-        let chunk_future = stream.next();
-        match tokio::time::timeout(std::time::Duration::from_secs(30), chunk_future).await {
-            Ok(Some(chunk_result)) => {
-                idle_secs = 0;
-                match chunk_result {
-                    Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        for line in text.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || !line.starts_with("data: ") { continue; }
-                            let data_str = &line[6..];
-                            if data_str == "[DONE]" { break; }
-                            if let Ok(c) = serde_json::from_str::<OpenAISseChunk>(data_str) {
-                                has_any_data = true;
-                                for choice in &c.choices {
-                                    if let Some(ref d) = choice.delta {
-                                        if let Some(ref r) = d.reasoning_content { if !r.is_empty() { sse_ctx.handle_reasoning(r); } }
-                                        if let Some(ref ct) = d.content { if !ct.is_empty() { sse_ctx.handle_content(ct); } }
-                                        if let Some(ref tcs) = d.tool_calls { for tc in tcs { sse_ctx.handle_tool_call(tc); } }
-                                    }
-                                    if let Some(ref fr) = choice.finish_reason { finish_reason = fr.clone(); }
-                                }
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                let text = String::from_utf8_lossy(&chunk);
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || !line.starts_with("data: ") { continue; }
+                    let data_str = &line[6..];
+                    if data_str == "[DONE]" { break; }
+                    if let Ok(c) = serde_json::from_str::<OpenAISseChunk>(data_str) {
+                        has_any_data = true;
+                        for choice in &c.choices {
+                            if let Some(ref d) = choice.delta {
+                                if let Some(ref r) = d.reasoning_content { if !r.is_empty() { sse_ctx.handle_reasoning(r); } }
+                                if let Some(ref ct) = d.content { if !ct.is_empty() { sse_ctx.handle_content(ct); } }
+                                if let Some(ref tcs) = d.tool_calls { for tc in tcs { sse_ctx.handle_tool_call(tc); } }
                             }
+                            if let Some(ref fr) = choice.finish_reason { finish_reason = fr.clone(); }
                         }
                     }
-                    Err(_) => {
-                        if has_any_data {
-                            finish_reason = "error".into();
-                        }
-                        break;
-                    }
                 }
             }
-            Ok(None) => {
-                // 流正常结束
-                break;
-            }
-            Err(_) => {
-                // 30s 无数据
-                idle_secs += 30;
-                if idle_secs >= 180 {
-                    warn!("[{}] SSE stream idle {}s, aborting", msg_id, idle_secs);
-                    finish_reason = "error".into();
-                    break;
-                }
-                if has_any_data {
-                    // 已有数据但暂时卡住，继续等
-                    continue;
-                }
-                // 还没收到任何数据就已超时 → 放弃
-                break;
-            }
+            Err(_) => { break; }
         }
     }
 

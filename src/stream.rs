@@ -3,7 +3,7 @@ use crate::types::*;
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 /// SSE 流处理状态机 — 将 OpenAI SSE 流转换为 Anthropic SSE 流
@@ -356,7 +356,7 @@ impl StreamContext {
 
         // Agent 模式下的自动恢复判断
         if self.is_agent_mode && !self.has_tool_use {
-            if let Some(reason) = recovery::should_recover(&self.generated_text, upstream_stop_reason)
+            if let Some(_reason) = recovery::should_recover(&self.generated_text, upstream_stop_reason)
             {
                 // 构建有效工具 map
                 let tool_refs: HashMap<String, &ToolDef> = self
@@ -367,16 +367,6 @@ impl StreamContext {
                 if let Some((target_name, target_args)) =
                     recovery::pick_recovery_tool(&tool_refs)
                 {
-                    let diag_msg = format!(
-                        "\n{}\n🚨 [holoProxy 自动恢复诊断]\n{}\n🔴 恢复原因: {}\n👇 下游 LLM 最后输出 (截断):\n{}\n{}",
-                        "=".repeat(40),
-                        "=".repeat(40),
-                        reason,
-                        &self.generated_text[self.generated_text.floor_char_boundary(self.generated_text.len().saturating_sub(400))..],
-                        "=".repeat(40)
-                    );
-                    info!("{}", diag_msg);
-
                     // 注入恢复标记
                     self.send_text_delta("[holoProxy Recovery ...]");
                     self.close_text();

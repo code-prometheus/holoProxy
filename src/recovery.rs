@@ -6,11 +6,7 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
         return Some("stop_reason=length".into());
     }
 
-    if generated_text.is_empty() {
-        return Some("empty response".into());
-    }
-
-    let mut score: i32 = -1; // 默认倾向恢复
+    let mut score: i32 = 0; // 默认中立（空响应不再触发恢复）
 
     // 加分项（表明不需要恢复）
     for &(kw, weight) in &[
