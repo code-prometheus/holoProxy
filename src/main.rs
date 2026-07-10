@@ -12,63 +12,57 @@ mod types;
 use tracing::info;
 use tracing_subscriber::{fmt::time::LocalTime, EnvFilter};
 
+fn log_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        exe.parent().unwrap_or(std::path::Path::new(".")).join("holoProxy.log")
+    } else {
+        std::path::PathBuf::from("holoProxy.log")
+    }
+}
+
 fn main() {
-    // 初始化日志
+    // 每次启动清空日志
+    let lp = log_path();
+    let _ = std::fs::write(&lp, "");
+
+    let file_appender = tracing_appender::rolling::never(
+        lp.parent().unwrap_or(std::path::Path::new(".")),
+        lp.file_name().unwrap_or(std::ffi::OsStr::new("holoProxy.log")),
+    );
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_timer(LocalTime::rfc_3339())
         .with_target(false)
+        .with_writer(file_appender)
         .init();
 
-    info!("🚀 holoProxy v{} 启动中...", env!("CARGO_PKG_VERSION"));
-    info!("📋 监听端口: 127.0.0.1:5430");
+    info!("🚀 holoProxy v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!("📋 port: 127.0.0.1:5430");
 
-    // 验证配置
     match config::get_active_llm_config() {
-        Some(c) => info!(
-            "✅ 当前激活 LLM: {} ({})",
-            config::get_active_llm_name(),
-            c.model_name
-        ),
-        None => info!("⚠️ 无激活的 LLM 配置，请在 settings.json 中配置"),
+        Some(c) => info!("✅ active LLM: {} ({}) auto_select:{}", config::get_active_llm_name(), c.model_name, config::is_auto_select()),
+        None => info!("⚠️  no LLM configured"),
     }
 
-    // 在后台线程启动 tokio + axum HTTP 服务器
+    // 后台线程跑 tokio + axum
     let http_thread = std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("Failed to create tokio runtime");
+            .expect("tokio runtime");
 
         rt.block_on(async {
-            // 定时清理器
-            tokio::spawn(async {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    tracing::debug!("🕐 [Cleanup] 定时清理 tick");
-                }
-            });
-
             let app = server::create_router();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:5430")
                 .await
-                .expect("❌ 无法绑定端口 5430");
-
-            info!("🌐 HTTP 服务已启动: http://127.0.0.1:5430");
-            info!("   POST /v1/messages    → Claude Code API 代理");
-            info!("   GET  /v1/models      → 查看可用模型");
-            info!("   POST /v1/select_model → 切换激活模型");
-
+                .expect("port 5430");
+            info!("HTTP server ready: http://127.0.0.1:5430");
             axum::serve(listener, app).await.unwrap();
         });
     });
 
-    // 主线程：运行系统托盘（winit event loop 必须在主线程）
+    // 主线程跑 tray
     tray::run_tray();
-
-    // 托盘退出后，等待 HTTP 线程结束
     let _ = http_thread.join();
 }

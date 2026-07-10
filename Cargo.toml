@@ -22,3 +22,4 @@ futures-util = "0.3"
 crossbeam-channel = "0.5.16"
 async-stream = "0.3.6"
 indexmap = { version = "2", features = ["serde"] }
+tracing-appender = "0.2"
