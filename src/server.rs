@@ -10,7 +10,6 @@ use bytes::Bytes;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
@@ -20,20 +19,15 @@ use crate::converter::convert_to_openai_req;
 use crate::stream::StreamContext;
 use crate::types::*;
 
-// 全局 HTTP Client — 连接池复用，减少 TCP 握手开销
-fn shared_http_client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(8)
-            .pool_idle_timeout(std::time::Duration::from_secs(120))
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("shared HTTP client")
-    })
+/// 每次重试都新建——确保不用已断开的TCP连接
+fn fresh_client() -> Client {
+    Client::builder()
+        .danger_accept_invalid_certs(true)
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("fresh HTTP client")
 }
 
 type ActiveConns = Arc<Mutex<HashMap<String, std::time::Instant>>>;
@@ -181,22 +175,11 @@ async fn background_request(
     for attempt in 1..=MAX_RETRIES {
         let remaining = MAX_RETRIES - attempt;
         info!(
-            "[{}] attempt={}/{} remaining={} conn={} url={}",
-            msg_id, attempt, MAX_RETRIES, remaining,
-            if attempt == 1 { "pooled" } else { "fresh" },
-            api_url
+            "[{}] attempt={}/{} remaining={} url={}",
+            msg_id, attempt, MAX_RETRIES, remaining, api_url
         );
 
-        // 首次尝试用共享 Client（连接池复用），重试时新建 Client 避免复用断开的连接
-        let client: Client = if attempt == 1 {
-            shared_http_client().clone()
-        } else {
-            Client::builder()
-                .danger_accept_invalid_certs(true)
-                .pool_max_idle_per_host(0)
-                .tcp_nodelay(true)
-                .build().unwrap()
-        };
+        let client = fresh_client();
 
         let mut req = client.post(api_url).json(openai_req)
             .header("Content-Type", "application/json")
@@ -229,9 +212,10 @@ async fn background_request(
                 info!("[{}] attempt={} timeout={}s", msg_id, attempt, timeout_secs);
             }
         }
+        // drop(client) — 释放本次 attempt 的 TCP 连接
 
         if attempt < MAX_RETRIES {
-            info!("[{}] retry {}/{} remaining={} after {}", msg_id, attempt, MAX_RETRIES, remaining - 1, last_err);
+            info!("[{}] retry {}/{} remaining={} err={}", msg_id, attempt, MAX_RETRIES, remaining - 1, last_err);
         }
     }
 

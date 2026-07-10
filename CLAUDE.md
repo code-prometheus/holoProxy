@@ -104,9 +104,8 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
   - `GET /v1/models` → 返回可用模型列表和当前激活模型
   - `POST /v1/select_model` → 切换 active_llm
   - 定时清理长时间未响应的 LLM 线程
-- **断线重连**：下游 LLM 连接失败时静默重试 3 次（无 sleep 延迟），全部失败后将错误通过 SSE 流直接反馈给 Claude Code
-- **连接池**：全局 `reqwest::Client`（`OnceLock`，`pool_max_idle_per_host=8`），首次请求建立 TCP 连接后复用，重试时新建 Client（`pool_max_idle=0`）避免复用断开的连接
-- 日志格式 `[msg_id] attempt=N/3 remaining=M conn=pooled|fresh url=...`，含 HTTP 状态码、连接耗时详细记录
+- **重连机制**：每次重试都新建 `reqwest::Client`（`pool_max_idle_per_host=0`），确保不重用已断开的 TCP 连接。失败后通过 `send_error()` SSE 流将错误直接反馈给 Claude Code
+- 日志格式 `[msg_id] attempt=N/3 remaining=M url=... http=STATUS in=X.Xs`，含 HTTP 状态码、连接耗时、重试进度
 
 #### 6. Windows 托盘模块 (`tray.rs`)
 - 系统托盘图标
@@ -213,5 +212,5 @@ winit = "0.30"                # 窗口事件循环（托盘需要）
 - 对下游 LLM 的 SSL 证书验证默认忽略（`danger_accept_invalid_certs: true`）
 - 下游 API 返回错误时，返回 200 + 包含错误信息的 SSE 流，而不是直接返回 5xx，避免 Claude Code 崩溃
 - 恢复机制注入的命令必须跨平台兼容（同时兼容 Windows cmd 和 Linux/Mac bash）
-- 下游 LLM 连接失败时静默重试 3 次（无 sleep），失败后将错误通过 `send_error()` SSE 流反馈给 Claude Code
-- 首次请求用全局 `shared_http_client()`（连接池复用），重试时新建 Client（`pool_max_idle=0`）避免复用断开的连接
+- 下游 LLM 连接失败时静默重试 3 次（每次新建 Client），失败后将错误通过 `send_error()` SSE 流反馈给 Claude Code
+- 每次重试都用 `fresh_client()` 新建 `reqwest::Client`（`pool_max_idle_host=0`），杜绝复用已断开的连接
