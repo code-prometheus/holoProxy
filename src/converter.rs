@@ -16,7 +16,7 @@ pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMC
     let mut openai_req = OpenAIRequest {
         model: llm_config.model_name.clone(),
         messages: Vec::new(),
-        stream: anthropic_req.stream,
+        stream: true, // 强制流式，防止下游 LLM 非流式导致超时
         tools: None,
         max_tokens: anthropic_req.max_tokens.map(|mt| mt.min(8192)),
         temperature: anthropic_req.temperature,

@@ -10,7 +10,16 @@ mod tray;
 mod types;
 
 use tracing::info;
-use tracing_subscriber::{fmt::time::LocalTime, EnvFilter};
+use tracing_subscriber::EnvFilter;
+
+// 自定义时间格式：简化为 HH:MM:SS，无颜色
+struct SimpleTimer;
+impl tracing_subscriber::fmt::time::FormatTime for SimpleTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%H:%M:%S"))
+    }
+}
 
 fn log_path() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe() {
@@ -32,7 +41,8 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with_timer(LocalTime::rfc_3339())
+        .with_timer(SimpleTimer)
+        .with_ansi(false)
         .with_target(false)
         .with_writer(file_appender)
         .init();

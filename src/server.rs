@@ -261,9 +261,7 @@ async fn try_request(
         // drop(client) — Client 销毁时关闭所有连接池中的 TCP 连接
 
         if attempt < MAX_RETRIES {
-            if attempt == 1 {
-                info!("[{}] retry {}/{}: {}", msg_id, attempt, MAX_RETRIES, last_err);
-            }
+            info!("[{}] retry {}/{} after {} ({}s sleep)", msg_id, attempt, MAX_RETRIES, last_err, attempt.min(6));
             let delay = std::time::Duration::from_secs(attempt.min(6) as u64);
             tokio::time::sleep(delay).await;
             continue;
@@ -297,16 +295,22 @@ async fn forward_sse(
     tx: &mpsc::Sender<Bytes>,
 ) -> bool {
     use futures_util::StreamExt;
+    let req_start = std::time::Instant::now();
     let mut stream = response.bytes_stream();
     let mut sse_ctx = StreamContext::new(
         msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(),
     );
     let mut finish_reason = String::from("stop");
     let mut has_any_data = false;
+    let mut first_token = true;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
+                if first_token {
+                    first_token = false;
+                    info!("[rsp {}] {} first_token in {:.1}s", msg_id, model_name, req_start.elapsed().as_secs_f64());
+                }
                 let text = String::from_utf8_lossy(&chunk);
                 for line in text.lines() {
                     let line = line.trim();
