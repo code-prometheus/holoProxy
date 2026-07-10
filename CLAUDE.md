@@ -154,7 +154,7 @@ struct Settings {
 ## 构建与运行
 
 ```bash
-cargo build --release          # 编译 release 版本
+cargo build --release  # 编译 release 版本（纯 Rust 依赖，无需安装任何系统库）
 cargo run                      # 开发运行
 cargo test                     # 运行测试
 cargo test -- --nocapture      # 运行测试并显示输出
