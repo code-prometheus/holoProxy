@@ -66,7 +66,11 @@ jobs:
           name: holoProxy-windows-x64
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: holoProxy-windows-x64.zip
-          generate_release_notes: true
+        shell: bash
+        run: |
+          gh release create "${{ github.ref_name }}" holoProxy-windows-x64.zip \
+            --title "holoProxy ${{ github.ref_name }}" \
+            --generate-notes \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
