@@ -202,7 +202,7 @@ winit = "0.30"                # 窗口事件循环（托盘需要）
 1. **协议转换**（Anthropic → OpenAI，含 tools instruction 注入）
 2. **SSE 流处理状态机**（OpenAI SSE → Anthropic SSE，含 XML 工具调用拦截）
 3. **自动恢复机制**（防止纯文本输出卡死 Claude Code）
-4. **HTTP 代理服务**（监听 60130，路由分发）
+4. **HTTP 代理服务**（监听 5430，路由分发）
 5. **配置管理**（settings.json 读写 + 动态切换）
 6. **Windows 托盘**（右键菜单切换模型）
 
