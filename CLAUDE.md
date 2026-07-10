@@ -97,19 +97,21 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 - **上下文清洗**（`clean_recovery_garbage()`）：
   - 在下一次请求构建时，将历史消息中的恢复标记替换为简短文本，防止上下文膨胀
 
-#### 5. HTTP 代理模块 (`proxy.rs`)
+#### 5. HTTP 代理模块 (`server.rs`)
 - 监听 `127.0.0.1:5430`
 - 路由分发：
   - `POST /v1/messages` → LLM 代理处理（异步，不阻塞 accept 循环）
   - `GET /v1/models` → 返回可用模型列表和当前激活模型
   - `POST /v1/select_model` → 切换 active_llm
-  -  定时清理长时间为响应的LLM线程
+  - 定时清理长时间未响应的 LLM 线程
+- **断线重连**：下游 LLM 连接失败时静默重试 3 次（无 sleep 延迟），全部失败后将错误通过 SSE 流直接反馈给 Claude Code
+- **连接池**：全局 `reqwest::Client`（`OnceLock`，`pool_max_idle_per_host=8`），首次请求建立 TCP 连接后复用，重试时新建 Client（`pool_max_idle=0`）避免复用断开的连接
+- 日志格式 `[msg_id] attempt=N/3 remaining=M conn=pooled|fresh url=...`，含 HTTP 状态码、连接耗时详细记录
 
 #### 6. Windows 托盘模块 (`tray.rs`)
 - 系统托盘图标
-- 右键菜单：列出所有已配置的下游 LLM
-- 点击切换：更新 settings.json 中的 `active_llm` 字段
-- 可选：切换后热重载（无需重启代理）
+- 右键菜单：列出所有已配置的下游 LLM（当前激活的模型标记 ✓）
+- 点击切换：更新 settings.json 中的 `active_llm` 字段（无需重启代理）
 
 ## 关键数据结构
 
@@ -145,11 +147,8 @@ struct OpenAIRequest {
 ### Settings 配置结构
 ```rust
 struct Settings {
-    common: CommonConfig,
-    client: ClientConfig,
     active_llm: String,
-    llms: HashMap<String, LLMConfig>,
-    routing: RoutingConfig,       // 可选，本次不实现代理分流功能
+    llms: IndexMap<String, LLMConfig>,
 }
 ```
 
@@ -177,7 +176,6 @@ Release 输出：`target/release/holo_proxy.exe`（Windows 托盘应用）
             "base_url": "http://xxx:8000/v1",
             "model_name": "dsv4",
             "context_max_length": "1m",
-            "verify_ssl": false,
             "api_key": "none"
         }
     }
@@ -212,7 +210,8 @@ winit = "0.30"                # 窗口事件循环（托盘需要）
 
 - 参考 proxy-bridge 时仅关注 `anthropic_proxy.py` 的 Claude Code 接口逻辑，忽略 Chrome 扩展、Native Messaging、远程隧道、TLS 中间人等与 Claude Code 代理无关的功能
 - 忽略 TLS/MITM 代理、域名分流、Chrome Native Messaging 桥接等功能
-- 对下游 LLM 的 SSL 证书验证默认忽略（`verify_ssl: false`）
+- 对下游 LLM 的 SSL 证书验证默认忽略（`danger_accept_invalid_certs: true`）
 - 下游 API 返回错误时，返回 200 + 包含错误信息的 SSE 流，而不是直接返回 5xx，避免 Claude Code 崩溃
 - 恢复机制注入的命令必须跨平台兼容（同时兼容 Windows cmd 和 Linux/Mac bash）
-- 下游LLM反馈“[WinError 10054] 远程主机强迫关闭了一个现有的连接”时先不要直接反馈claude code,重试3次再反馈
+- 下游 LLM 连接失败时静默重试 3 次（无 sleep），失败后将错误通过 `send_error()` SSE 流反馈给 Claude Code
+- 首次请求用全局 `shared_http_client()`（连接池复用），重试时新建 Client（`pool_max_idle=0`）避免复用断开的连接

@@ -10,14 +10,31 @@ use bytes::Bytes;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use crate::config::{get_active_llm_name, get_llm_names, is_auto_select};
+use crate::config::{get_active_llm_name, get_llm_names};
 use crate::context::{calc_timeout_secs, parse_context_length};
 use crate::converter::convert_to_openai_req;
 use crate::stream::StreamContext;
 use crate::types::*;
+
+// 全局 HTTP Client — 连接池复用，减少 TCP 握手开销
+fn shared_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(std::time::Duration::from_secs(120))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("shared HTTP client")
+    })
+}
 
 type ActiveConns = Arc<Mutex<HashMap<String, std::time::Instant>>>;
 
@@ -76,13 +93,13 @@ async fn handle_messages(
         crate::context::trim_messages(&mut openai_req.messages, max_context);
     }
 
-    let req_bytes = serde_json::to_vec(&openai_req).map_or(0, |v| v.len());
+    let req_bytes = openai_req.messages.len() * 512;
     let msg_id = format!("msg_{}", chrono::Utc::now().timestamp());
     let timeout_secs = calc_timeout_secs(req_bytes);
 
     info!(
-        "[req {}] {}agent={} msgs={} tok={} max_ctx={} timeout={}s | {}",
-        msg_id, if is_auto_select() { "[AUTO]" } else { "" },
+        "[req {}] agent={} msgs={} tok={} max_ctx={} timeout={}s | {}",
+        msg_id,
         is_agent_mode, openai_req.messages.len(),
         crate::context::estimate_token_count(&openai_req.messages),
         max_context, timeout_secs, llm_config.model_name
@@ -126,12 +143,11 @@ async fn handle_messages(
     let oa_req = openai_req;
     let llm_cfg = llm_config;
     let conns = state.active_connections.clone();
-    let is_auto = is_auto_select();
 
     tokio::spawn(async move {
-        background_request_with_fallback(
+        background_request(
             &api, &oa_req, &llm_cfg, &mid, &model, is_agent_mode, &tools_arc,
-            timeout_secs, &tx, is_auto, Some(stop_ka_tx),
+            timeout_secs, &tx, Some(stop_ka_tx),
         ).await;
         conns.lock().await.remove(&mid);
     });
@@ -149,75 +165,38 @@ async fn handle_messages(
         .unwrap()
 }
 
-const MAX_RETRIES: u32 = 10;
+const MAX_RETRIES: u32 = 3;
 
-async fn background_request_with_fallback(
-    api_url: &str, openai_req: &OpenAIRequest,
-    llm_config: &crate::types::LLMConfig,
-    msg_id: &str, model_name: &str,
-    is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
-    timeout_secs: u64, tx: &mpsc::Sender<Bytes>, is_auto: bool,
-    stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    // keepalive 只在初始请求时使用，fallback/重试都不需要
-    let (sk, retries, last_err) = try_request(
-        api_url, openai_req, llm_config, msg_id, model_name,
-        is_agent_mode, valid_tools, timeout_secs, tx, stop_keepalive,
-    ).await;
-
-    if sk { return; }
-
-    if !is_auto {
-        info!("[{}] fail after {} retries: {}", msg_id, retries, last_err);
-        send_keepalive_response(msg_id, model_name, is_agent_mode, valid_tools, tx).await;
-        return;
-    }
-
-    let mut fb_count = 0;
-    loop {
-        match crate::config::auto_fallback_llm() {
-            Some((name, config)) => {
-                fb_count += 1;
-                let fb_url: Arc<str> = {
-                    let base = config.base_url.trim_end_matches('/');
-                    if base.ends_with("/chat/completions") {
-                        base.to_string().into()
-                    } else {
-                        format!("{}/chat/completions", base).into()
-                    }
-                };
-                info!("[{}] auto-fallback #{}/{} → {}", msg_id, fb_count, name, config.model_name);
-
-                let (ok, _, _) = try_request(
-                    &fb_url, openai_req, &config, msg_id, &config.model_name,
-                    is_agent_mode, valid_tools, timeout_secs, tx, None,
-                ).await;
-                if ok { return; }
-            }
-            None => {
-                warn!("[{}] all LLMs exhausted after {} fallbacks", msg_id, fb_count);
-                send_keepalive_response(msg_id, model_name, is_agent_mode, valid_tools, tx).await;
-                return;
-            }
-        }
-    }
-}
-
-async fn try_request(
+async fn background_request(
     api_url: &str, openai_req: &OpenAIRequest,
     llm_config: &crate::types::LLMConfig,
     msg_id: &str, model_name: &str,
     is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
     timeout_secs: u64, tx: &mpsc::Sender<Bytes>,
     mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
-) -> (bool, u32, String) {
+) {
     let mut last_err = String::new();
+    let req_start = std::time::Instant::now();
 
     for attempt in 1..=MAX_RETRIES {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(0)
-            .build().unwrap();
+        let remaining = MAX_RETRIES - attempt;
+        info!(
+            "[{}] attempt={}/{} remaining={} conn={} url={}",
+            msg_id, attempt, MAX_RETRIES, remaining,
+            if attempt == 1 { "pooled" } else { "fresh" },
+            api_url
+        );
+
+        // 首次尝试用共享 Client（连接池复用），重试时新建 Client 避免复用断开的连接
+        let client: Client = if attempt == 1 {
+            shared_http_client().clone()
+        } else {
+            Client::builder()
+                .danger_accept_invalid_certs(true)
+                .pool_max_idle_per_host(0)
+                .tcp_nodelay(true)
+                .build().unwrap()
+        };
 
         let mut req = client.post(api_url).json(openai_req)
             .header("Content-Type", "application/json")
@@ -230,46 +209,50 @@ async fn try_request(
         let send_future = req.send();
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), send_future).await {
             Ok(Ok(response)) => {
-                // 只有初始请求需要 keepalive，重试不需要
+                let status = response.status().as_u16();
+                info!("[{}] attempt={} http={} in={:.1}s", msg_id, attempt, status, req_start.elapsed().as_secs_f64());
                 let ka = if attempt == 1 { stop_keepalive.take() } else { None };
                 let has_output = forward_sse(
                     response, msg_id, model_name, is_agent_mode, valid_tools, tx, ka,
                 ).await;
                 if has_output {
-                    return (true, 0, String::new());
+                    return;
                 }
                 last_err = "empty response".into();
             }
             Ok(Err(e)) => {
                 last_err = e.to_string();
+                info!("[{}] attempt={} conn_err={}", msg_id, attempt, last_err);
             }
             Err(_) => {
                 last_err = format!("timeout {}s", timeout_secs);
+                info!("[{}] attempt={} timeout={}s", msg_id, attempt, timeout_secs);
             }
         }
-        // drop(client) 释放 TCP 连接
 
         if attempt < MAX_RETRIES {
-            info!("[{}] retry {}/{} after {} ({}s sleep)", msg_id, attempt, MAX_RETRIES, last_err, attempt.min(6));
-            let delay = std::time::Duration::from_secs(attempt.min(6) as u64);
-            tokio::time::sleep(delay).await;
-            continue;
+            info!("[{}] retry {}/{} remaining={} after {}", msg_id, attempt, MAX_RETRIES, remaining - 1, last_err);
         }
     }
-    warn!("[{}] {} retries exhausted: {}", msg_id, MAX_RETRIES, last_err);
-    (false, MAX_RETRIES, last_err)
+
+    warn!("[{}] ALL {} retries exhausted after {:.1}s: {}", msg_id, MAX_RETRIES, req_start.elapsed().as_secs_f64(), last_err);
+    send_error_response(msg_id, model_name, is_agent_mode, valid_tools, tx, &last_err).await;
 }
 
-async fn send_keepalive_response(
+async fn send_error_response(
     msg_id: &str, model_name: &str,
     is_agent_mode: bool,
     valid_tools: &Arc<HashMap<String, ToolDef>>,
     tx: &mpsc::Sender<Bytes>,
+    last_err: &str,
 ) {
     let mut sse_ctx = StreamContext::new(
         msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(),
     );
-    sse_ctx.fallback_empty_finish();
+    sse_ctx.send_error(&format!(
+        "[holoProxy Error] 下游 LLM 连接失败 (已重试{}次): {}",
+        MAX_RETRIES, last_err
+    ));
     for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
 }
 
@@ -331,27 +314,12 @@ async fn forward_sse(
 async fn handle_get_models() -> impl IntoResponse {
     Json(serde_json::json!({
         "active_llm": get_active_llm_name(),
-        "auto_select": is_auto_select(),
         "models": get_llm_names()
     }))
 }
 
 async fn handle_select_model(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let name = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-
-    if name == "__auto__" || name == "auto" {
-        let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-        crate::config::switch_auto_select(enable);
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "success",
-                "auto_select": enable,
-                "active_llm": get_active_llm_name()
-            })),
-        );
-    }
-
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"status":"error","msg":"model required"})));
     }

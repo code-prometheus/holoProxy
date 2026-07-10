@@ -177,8 +177,6 @@ pub struct OpenAIFunctionDelta {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default)]
-    pub auto_select: bool,
-    #[serde(default)]
     pub active_llm: String,
     #[serde(default)]
     pub llms: IndexMap<String, LLMConfig>,

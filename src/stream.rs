@@ -402,11 +402,9 @@ impl StreamContext {
         );
     }
 
-    /// 空响应保活：生成最小完整的 Anthropic SSE 流，防止 Claude Code 空响应报错
-    pub fn fallback_empty_finish(&mut self) {
-        // 如果 message_start 还没发（没有输出过任何东西），手动发
-        // StreamContext::new 已经发了 message_start，所以这里直接收尾即可
-        self.send_text_delta("[holoProxy] 上游 LLM 暂时不可用，请稍后重试或切换模型。");
+    /// 发送错误消息并完成 SSE 流
+    pub fn send_error(&mut self, msg: &str) {
+        self.send_text_delta(msg);
         self.close_text();
         self.finish("end_turn");
     }

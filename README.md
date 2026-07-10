@@ -16,9 +16,10 @@
 - **自动恢复**：关键词权重打分，防止 Claude Code 因下游输出纯文本卡死
 - **上下文裁剪**：超过 80% 最大 token 时自动裁剪历史消息
 - **纯文本清洗**：去控制字符 + 压缩空白，每请求输出压缩比
-- **自动 Fallback**：第一个 LLM 10 次静默重试失败后自动切下一个
-- **Windows 系统托盘**：右键切换模型 / 自动选择模式
-- **连接管理**：300s 超时自动清理 + 空响应保活
+- **断线重连**：下游 LLM 连接失败后静默重试 3 次（无 sleep 延迟），失败将错误直接反馈给 Claude Code
+- **连接池复用**：全局 reqwest::Client 连接池，首次请求后 TCP 连接复用，大幅降低首 token 延迟
+- **Windows 系统托盘**：右键切换模型
+- **连接管理**：300s 超时自动清理
 
 ## 快速开始
 
@@ -32,7 +33,6 @@
 
 ```json
 {
-    "auto_select": false,
     "active_llm": "DeepSeek V4 pro",
     "llms": {
         "DeepSeek V4 pro": {
@@ -57,7 +57,6 @@
 | `auth_prefix` | 认证前缀 | `Bearer ` |
 | `supports_native_function_calling` | 是否支持原生 function calling | `true` |
 | `supports_reasoning_content` | 是否支持推理内容 | `false` |
-| `auto_select` | 自动 fallback 模式 | `false` |
 
 ### 3. 运行
 
@@ -65,7 +64,7 @@
 ./holo_proxy.exe
 ```
 
-系统托盘出现蓝色 "h" 图标。右键可切换模型或开启自动选择。
+系统托盘出现蓝色 "h" 图标。右键可切换模型。
 
 ### 4. 配置 Claude Code
 

@@ -2,7 +2,7 @@ use crate::types::{LLMConfig, Settings};
 use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
     if let Ok(exe) = std::env::current_exe() {
@@ -34,7 +34,7 @@ impl Settings {
                 supports_reasoning_content: false,
             },
         );
-        Settings { auto_select: false, active_llm: "默认本地大模型".into(), llms }
+        Settings { active_llm: "默认本地大模型".into(), llms }
     }
 
     pub fn load() -> Self {
@@ -65,23 +65,8 @@ impl Settings {
     }
 }
 
-pub fn is_auto_select() -> bool {
-    SETTINGS.read().unwrap().auto_select
-}
-
-pub fn switch_auto_select(enable: bool) {
-    let mut s = SETTINGS.write().unwrap();
-    s.auto_select = enable;
-    s.save();
-    info!("auto_select: {}", if enable { "ON" } else { "OFF" });
-}
-
 pub fn get_llm_names() -> Vec<String> {
     Settings::load().llms.keys().cloned().collect()
-}
-
-pub fn get_llm_names_cached() -> Vec<String> {
-    SETTINGS.read().unwrap().llms.keys().cloned().collect()
 }
 
 pub fn get_active_llm_name() -> String {
@@ -107,24 +92,4 @@ pub fn switch_active_llm(name: &str) -> Result<(), String> {
     s.save();
     info!("switch LLM → {}", name);
     Ok(())
-}
-
-/// 自动 fallback：返回按顺序的下一个 LLM
-pub fn auto_fallback_llm() -> Option<(String, LLMConfig)> {
-    let s = Settings::load();
-    let names: Vec<String> = s.llms.keys().cloned().collect();
-    let cur = s.active_llm.clone();
-    let pos = names.iter().position(|n| *n == cur).unwrap_or(0);
-    if pos + 1 >= names.len() {
-        warn!("auto_fallback: '{}' is last LLM", cur);
-        return None;
-    }
-    let next_name = names[pos + 1].clone();
-    let config = s.llms.get(&next_name).cloned()?;
-    // 切换到下一个
-    let mut sw = SETTINGS.write().unwrap();
-    sw.active_llm = next_name.clone();
-    sw.save();
-    info!("auto_fallback: {} → {}", cur, next_name);
-    Some((next_name, config))
 }

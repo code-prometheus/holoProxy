@@ -51,8 +51,8 @@ fn main() {
     info!("📋 port: 127.0.0.1:5430");
 
     match config::get_active_llm_config() {
-        Some(c) => info!("✅ active LLM: {} ({}) auto_select:{}", config::get_active_llm_name(), c.model_name, config::is_auto_select()),
-        None => info!("⚠️  no LLM configured"),
+        Some(c) => info!("✅ active LLM: {} ({})", config::get_active_llm_name(), c.model_name),
+        None => info!("⚠️ no LLM configured"),
     }
 
     // 后台线程跑 tokio + axum

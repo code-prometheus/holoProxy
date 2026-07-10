@@ -1,4 +1,4 @@
-use crate::config::{get_active_llm_name, get_llm_names_cached, is_auto_select};
+use crate::config::{get_active_llm_name, get_llm_names};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -58,24 +58,12 @@ fn load_icon() -> tray_icon::Icon {
 fn build_menu() -> tray_icon::menu::Menu {
     use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
 
-    let auto = is_auto_select();
     let active = get_active_llm_name();
-    let models = get_llm_names_cached();
+    let models = get_llm_names();
     let menu = Menu::new();
 
-    let auto_label = if auto {
-        format!("✓ 自动选择 (当前: {})", active)
-    } else {
-        "  自动选择".into()
-    };
-    menu.append(&MenuItem::with_id(
-        MenuId::new("__auto__".to_string()), auto_label, true, None,
-    )).ok();
-
-    menu.append(&PredefinedMenuItem::separator()).ok();
-
     for model in &models {
-        let label = if !auto && model == &active {
+        let label = if model == &active {
             format!("✓ {}", model)
         } else {
             format!("  {}", model)
@@ -94,15 +82,7 @@ fn handle_menu_id(id_str: &str, tray: &mut tray_icon::TrayIcon) {
         std::process::exit(0);
     }
 
-    if id_str == "__auto__" {
-        let new_state = !is_auto_select();
-        crate::config::switch_auto_select(new_state);
-        let _ = tray.set_menu(Some(Box::new(build_menu())));
-        let _ = tray.set_tooltip(Some(format!("holoProxy - {}", get_active_llm_name())));
-        return;
-    }
-
-    let models = get_llm_names_cached();
+    let models = get_llm_names();
     if models.contains(&id_str.to_string()) {
         let _ = crate::config::switch_active_llm(id_str);
         let _ = tray.set_menu(Some(Box::new(build_menu())));
@@ -155,7 +135,7 @@ pub fn run_tray() {
         Err(e) => { warn!("tray creation failed: {:?}", e); return; }
     };
 
-    info!("holoProxy tray ready | auto_select={} | active={}", is_auto_select(), get_active_llm_name());
+    info!("holoProxy tray ready | active={}", get_active_llm_name());
 
     let mut app = TrayApp { menu_event_rx, tray: Some(tray) };
     let _ = event_loop.run_app(&mut app);
