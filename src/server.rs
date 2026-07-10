@@ -298,7 +298,7 @@ async fn forward_sse(
                     first_token = false;
                     // 首 token 到达，停止 keepalive
                     if let Some(s) = stop_keepalive.take() { let _ = s.send(()); }
-                    info!("[rsp {}] {} first_token in {:.1}s", msg_id, model_name, req_start.elapsed().as_secs_f64());
+                    info!("[rsp {}] {} first_token in {:.1}s chunk={}B", msg_id, model_name, req_start.elapsed().as_secs_f64(), chunk.len());
                 }
                 let text = String::from_utf8_lossy(&chunk);
                 for line in text.lines() {
