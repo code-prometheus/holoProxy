@@ -1,9 +1,9 @@
 use crate::types::{LLMConfig, Settings};
 use indexmap::IndexMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
 use tracing::{error, info};
 
+// 查找配置文件的真实路径
 static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent().unwrap_or(std::path::Path::new(".")).join("settings.json");
@@ -14,8 +14,7 @@ static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::ne
     PathBuf::from("settings.json")
 });
 
-static SETTINGS: once_cell::sync::Lazy<RwLock<Settings>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(Settings::load()));
+// [修改] 移除了容易导致状态过期并错误覆盖本地文件的 static SETTINGS 全局内存缓存
 
 impl Settings {
     fn default_config() -> Self {
@@ -70,7 +69,8 @@ pub fn get_llm_names() -> Vec<String> {
 }
 
 pub fn get_active_llm_name() -> String {
-    SETTINGS.read().unwrap().active_llm.clone()
+    // [修改] 直接从磁盘获取，保证状态永远是最新
+    Settings::load().active_llm
 }
 
 pub fn get_active_llm_config() -> Option<LLMConfig> {
@@ -84,7 +84,10 @@ pub fn get_active_llm_config() -> Option<LLMConfig> {
 }
 
 pub fn switch_active_llm(name: &str) -> Result<(), String> {
-    let mut s = SETTINGS.write().unwrap();
+    // [修改] 先从磁盘 load 最新配置，然后在此基础上修改 active_llm 再保存
+    // 这样就不会因为内存数据过期而覆盖掉用户手动修改的参数 (比如 context_max_length)
+    let mut s = Settings::load();
+    
     if !s.llms.contains_key(name) {
         return Err(format!("LLM '{}' not found", name));
     }
