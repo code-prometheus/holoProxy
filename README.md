@@ -13,7 +13,7 @@
 - **协议转换**：Anthropic Messages API → OpenAI Chat Completions
 - **SSE 流处理**：完整的状态机，原生 tool_calls + XML 工具调用拦截双通道
 - **Tools Instruction 注入**：不支持原生 function calling 的模型自动注入 XML 格式指令
-- **自动恢复**：关键词权重打分，防止 Claude Code 因下游输出纯文本卡死
+- **自动恢复**：LLM 智能判断文本是否异常截断，替代硬编码关键词，防止 Claude Code 因下游输出不完整卡死
 - **上下文裁剪**：超过 80% 最大 token 时自动裁剪历史消息
 - **纯文本清洗**：去控制字符 + 压缩空白，每请求输出压缩比
 - **断线重连**：下游 LLM 连接失败后静默重试 3 次（无 sleep 延迟），失败将错误直接反馈给 Claude Code
