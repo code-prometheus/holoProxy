@@ -6,20 +6,14 @@
 
 [![CI](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml)
 
----
-
 ## 功能
 
 - **协议转换**：Anthropic Messages API → OpenAI Chat Completions
-- **SSE 流处理**：完整的状态机，原生 tool_calls + XML 工具调用拦截双通道
+- **SSE 流处理**：完整状态机，原生 tool_calls + XML 工具调用拦截双通道
 - **Tools Instruction 注入**：不支持原生 function calling 的模型自动注入 XML 格式指令
-- **自动恢复**：LLM 智能判断文本是否异常截断，替代硬编码关键词，防止 Claude Code 因下游输出不完整卡死
-- **上下文裁剪**：超过 80% 最大 token 时自动裁剪历史消息
-- **纯文本清洗**：去控制字符 + 压缩空白，每请求输出压缩比
-- **断线重连**：下游 LLM 连接失败后静默重试 3 次（无 sleep 延迟），失败将错误直接反馈给 Claude Code
-- **连接池复用**：全局 reqwest::Client 连接池，首次请求后 TCP 连接复用，大幅降低首 token 延迟
+- **自动恢复**：硬编码拦截 API 错误/超时 + LLM 智能判断异常截断，防止 Claude Code 卡死
+- **断线重连**：下游连接失败后静默重试 3 次，失败将错误反馈给 Claude Code
 - **Windows 系统托盘**：右键切换模型
-- **连接管理**：300s 超时自动清理
 
 ## 快速开始
 
@@ -33,15 +27,15 @@
 
 ```json
 {
-    "active_llm": "DeepSeek V4 pro",
-    "llms": {
-        "DeepSeek V4 pro": {
-            "base_url": "http://your-llm:8000/v1",
-            "model_name": "dsv4",
-            "context_max_length": "1m",
-            "api_key": "none"
-        }
-    }
+ "active_llm": "DeepSeek V4 pro",
+ "llms": {
+ "DeepSeek V4 pro": {
+ "base_url": "http://your-llm:8000/v1",
+ "model_name": "dsv4",
+ "context_max_length": "1m",
+ "api_key": "none"
+ }
+ }
 }
 ```
 
@@ -64,7 +58,7 @@
 ./holo_proxy.exe
 ```
 
-系统托盘出现蓝色 "h" 图标。右键可切换模型。
+系统托盘出现蓝色 "h" 图标，右键可切换模型。
 
 ### 4. 配置 Claude Code
 
@@ -81,14 +75,13 @@
 ## 从源码构建
 
 ```bash
-# 需要 Rust 1.70+
 cargo build --release
 # 输出: target/release/holo_proxy.exe
 ```
 
 ## 技术栈
 
-Rust · axum · tokio · reqwest · tray-icon · winit · indexmap
+Rust · axum · tokio · reqwest · tray-icon · winit
 
 ## License
 

@@ -13,20 +13,35 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
         return None;
     }
 
-    // 2. 空文本或纯空白文本：视为异常中断或无意义输出，直接触发恢复
+    // 2. 【核心修复】硬编码拦截特定的 API 错误/超时信息
+    // 防止 LLM 将“完整的错误提示”误判为“正常结束 (COMPLETE)”
+    let lower_text = generated_text.to_lowercase();
+    if lower_text.contains("timed out") || 
+       lower_text.contains("empty or malformed response") || 
+       lower_text.contains("api error") ||
+       lower_text.contains("operation timed out") ||
+       lower_text.contains("malformed") {
+        tracing::warn!("🚨 [Recovery] Detected API Error/Timeout in text, forcing recovery bypass LLM.");
+        return Some("detected API error or timeout".into());
+    }
+
+    // 3. 空文本或纯空白文本：视为异常中断，直接触发恢复
     if generated_text.trim().is_empty() {
         return Some("empty or whitespace-only text".into());
     }
 
-    // 3. 获取当前激活的 LLM 配置
+    // 4. 获取当前激活的 LLM 配置
     let config = match crate::config::get_active_llm_config() {
         Some(c) => c,
         None => return Some("no active LLM config for recovery check".into()),
     };
 
-    // 4. 开一个独立线程专门去咨询 LLM，避免阻塞主异步运行时
+    // 5. 开一个独立线程专门去咨询 LLM，避免阻塞主异步运行时
     let text = generated_text.to_string();
     let handle = std::thread::spawn(move || {
+        // 【新增】启动 LLM 判断时打印日志
+        tracing::info!("🔍 [Recovery] Starting LLM semantic check (text length: {} bytes)...", text.len());
+        
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -37,7 +52,7 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
         })
     });
 
-    // 5. 等待线程结果
+    // 6. 等待线程结果
     match handle.join() {
         Ok(Some(reason)) => Some(reason),
         Ok(None) => None,
@@ -61,7 +76,7 @@ async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> 
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     
-    // 【核心改进】：注入 AI Agent/Claude Code 的业务上下文，让 LLM 准确区分“正常交互停顿”和“异常截断”
+    // 注入 AI Agent/Claude Code 的业务上下文
     let body = serde_json::json!({
         "model": config.model_name,
         "messages": [
@@ -100,7 +115,6 @@ async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> 
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
                     let lower = content.to_lowercase();
-                    // 只要 LLM 认为是不正常截断，就触发恢复
                     if lower.contains("incomplete") {
                         return Some("LLM judged text as abnormally cut-off".into());
                     }
@@ -110,7 +124,7 @@ async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> 
         }
         Err(e) => {
             tracing::warn!("Recovery LLM check failed: {}", e);
-            None // 检查失败时默认不恢复，避免网络波动导致死循环
+            None 
         }
     }
 }
@@ -174,24 +188,25 @@ mod tests {
 
     #[test]
     fn test_should_recover_length() {
-        // stop_reason == "length" 应该直接触发恢复，不经过 LLM 检查
         assert!(should_recover("some text", "length").is_some());
     }
 
     #[test]
     fn test_prevent_infinite_loop() {
-        // 包含恢复标记时，应直接返回 None 防止死循环
         assert!(should_recover("[holoProxy Recovery] some text", "stop").is_none());
     }
 
     #[test]
     fn test_empty_text_recovery() {
-        // 空文本或纯空白文本应直接触发恢复
         assert!(should_recover("", "stop").is_some());
         assert!(should_recover("   \n\t  ", "stop").is_some());
     }
-    
-    // 注意：由于现在依赖真实的 LLM 网络请求来判断语义，
-    // 原有的基于硬编码关键词的单元测试（如 test_should_not_recover_on_question）已不再适用，
-    // 故在此移除，以保证 `cargo test` 能够在无网络环境下顺利跑通。
+
+    #[test]
+    fn test_api_error_intercept() {
+        // 验证新增的硬编码拦截是否生效
+        assert!(should_recover("API Error: The operation timed out.", "stop").is_some());
+        assert!(should_recover("API Error: API returned an empty or malformed response (HTTP 200)", "stop").is_some());
+        assert!(should_recover("Some normal text. API Error occurred.", "stop").is_some());
+    }
 }
