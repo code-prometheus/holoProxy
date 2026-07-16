@@ -2,6 +2,7 @@ use tracing;
 
 /// 判断是否需要在 finish 时注入恢复工具
 /// 利用 LLM 智能判断文本是否被异常截断，代替硬编码关键词
+#[allow(dead_code)]
 pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String> {
     // 0. stop_reason == 'length' → API 明确告知被截断，总是需要恢复
     if stop_reason == "length" {
@@ -61,6 +62,7 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
 }
 
 /// 异步咨询 LLM 判断文本是否不完整
+#[allow(dead_code)]
 async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> Option<String> {
     // 安全截取最后约 1500 字节，判断截断主要看结尾上下文，节省 Token
     let text_to_check = if text.len() > 1500 {

@@ -71,24 +71,21 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 - **错误恢复**：`send_error()` 在 agent 模式下直接注入 fake tool，防止 Claude Code 因无 tool_use 响应报 API Error
 
 #### 4. 自动恢复机制 (`recovery.rs`)
-防止下游 LLM 输出纯文本/废话导致 Claude Code 卡死。
 
-**判断流程**（`should_recover()`）：
-1. `stop_reason == "length"` → 直接触发恢复
-2. 包含 `[holoProxy Recovery]` 或 `[holoProxy Error]` → 不恢复（防止死循环）
-3. 硬编码拦截 API 错误关键词（`timed out`, `empty or malformed response`, `api error`, `operation timed out`, `malformed`）→ 直接触发恢复
-4. 空文本/纯空白 → 直接触发恢复
-5. 以上都不满足 → 启动 LLM 语义判断（独立线程 + tokio runtime）
+**核心原则：宁可乱杀不能错过。** agent 模式下只要没有 tool_use，无条件注入 fake tool，不依赖 LLM 语义判断是否触发。后果是宁可注入假的 tool_use 让 Claude Code 继续，也绝不能让它因无 tool_use 报 API Error 退出。
 
-**LLM 判断**（`ask_llm_if_incomplete()`）：
-- 截取文本尾部 ~1500 字节发送给下游 LLM
-- 下游 LLM 判断是"正常结束 (COMPLETE)"还是"异常截断 (INCOMPLETE)"
-- LLM 判断返回 "incomplete" 才触发恢复
+**恢复入口**：
+- `finish()`：agent 模式 + 无 tool_use → 直接注入 fake tool
+- `send_error()`：agent 模式 + 无 tool_use → 直接注入 fake tool（重试耗尽后的错误响应）
 
 **恢复动作**（`pick_recovery_tool()`）：
 - 优先选取 Bash/Shell/RunCommand/Execute 等无害工具
 - 注入跨平台兼容命令：`echo "Fake tool calling ..." && pwd && ls -la || cd && dir`
-- 向 Claude Code 发送 `[holoProxy Recovery ...]` 标记文本
+- 向 Claude Code 发送 `[holoProxy Recovery Injected]` 标记文本
+
+**LLM 语义判断**（`should_recover()` / `ask_llm_if_incomplete()`）：
+- 当前保留但暂不使用，以备将来需要精细判断的场景
+- 硬编码关键词拦截仍保留用于单元测试验证
 
 #### 5. HTTP 代理模块 (`server.rs`)
 - 监听 `127.0.0.1:5430`
