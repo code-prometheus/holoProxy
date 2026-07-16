@@ -68,6 +68,7 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 - **XML 工具调用拦截**：下游在 content 文本中输出 `<tool_call>...</tool_call>` XML 时，拦截并转换为正式 tool_use 事件
 - **Fallback 解析**：DSML 标签、JSON 块、MD 代码块等多种格式的工具调用尝试解析
 - **finish_reason 映射**：`tool_calls`/stop/length → `stop_reason: "tool_use"` 或 `"end_turn"`
+- **错误恢复**：`send_error()` 在 agent 模式下直接注入 fake tool，防止 Claude Code 因无 tool_use 响应报 API Error
 
 #### 4. 自动恢复机制 (`recovery.rs`)
 防止下游 LLM 输出纯文本/废话导致 Claude Code 卡死。
