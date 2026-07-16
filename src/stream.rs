@@ -406,6 +406,26 @@ impl StreamContext {
     pub fn send_error(&mut self, msg: &str) {
         self.send_text_delta(msg);
         self.close_text();
+        // Agent 模式下必须注入 fake tool，防止 Claude Code 报 API Error
+        if self.is_agent_mode && !self.has_tool_use {
+            let tool_refs: HashMap<String, &ToolDef> = self
+                .valid_tools
+                .iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect();
+            if let Some((target_name, target_args)) =
+                recovery::pick_recovery_tool(&tool_refs)
+            {
+                self.send_text_delta("[holoProxy Recovery Injected]");
+                self.close_text();
+                let tool_id = gen_tool_id();
+                self.open_tool(&tool_id, &target_name);
+                let args_str =
+                    serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".into());
+                self.send_tool_delta(&args_str);
+                self.close_tool();
+            }
+        }
         self.finish("end_turn");
     }
 }
