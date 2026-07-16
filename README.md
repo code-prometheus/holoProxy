@@ -11,8 +11,8 @@
 - **协议转换**：Anthropic Messages API → OpenAI Chat Completions
 - **SSE 流处理**：完整状态机，原生 tool_calls + XML 工具调用拦截双通道
 - **Tools Instruction 注入**：不支持原生 function calling 的模型自动注入 XML 格式指令
-- **自动恢复**：agent 模式下无 tool_use 时无条件注入 fake tool，宁可过量不遗漏，防止 Claude Code 报 API Error 退出
-- **断线重连**：下游连接失败后静默重试 3 次，失败将错误反馈给 Claude Code
+- **智能恢复**：硬编码拦截 API 错误/超时 + LLM 语义判断正常结束/异常截断，精准注入 fake tool 防止 Claude Code 报 API Error 退出
+- **断线重连**：下游连接失败后静默重试 3 次，error 路径无条件注入 fake tool
 - **Windows 系统托盘**：右键切换模型
 
 ## 快速开始

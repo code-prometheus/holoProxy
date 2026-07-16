@@ -319,7 +319,7 @@ impl StreamContext {
     }
 
     /// 结束流：关闭所有开放块 + 自动恢复判断 + 发送 message_delta/message_stop
-    pub fn finish(&mut self, _upstream_stop_reason: &str) {
+    pub fn finish(&mut self, upstream_stop_reason: &str) {
         // 保底：防止空响应
         if !self.text_open && !self.has_tool_use {
             self.send_text_delta(" ");
@@ -354,25 +354,27 @@ impl StreamContext {
         }
         self.active_native_tools.clear();
 
-        // Agent 模式下无条件注入 fake tool（宁可乱杀不可错过）
-        // Claude Code 收到无 tool_use 的 agent 响应会报 API Error 退出
+        // Agent 模式下的自动恢复判断（硬编码拦截 + LLM 语义判断双保险）
         if self.is_agent_mode && !self.has_tool_use {
-            let tool_refs: HashMap<String, &ToolDef> = self
-                .valid_tools
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect();
-            if let Some((target_name, target_args)) =
-                recovery::pick_recovery_tool(&tool_refs)
+            if let Some(_reason) = recovery::should_recover(&self.generated_text, upstream_stop_reason)
             {
-                self.send_text_delta("[holoProxy Recovery Injected]");
-                self.close_text();
-                let tool_id = gen_tool_id();
-                self.open_tool(&tool_id, &target_name);
-                let args_str =
-                    serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".into());
-                self.send_tool_delta(&args_str);
-                self.close_tool();
+                let tool_refs: HashMap<String, &ToolDef> = self
+                    .valid_tools
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v))
+                    .collect();
+                if let Some((target_name, target_args)) =
+                    recovery::pick_recovery_tool(&tool_refs)
+                {
+                    self.send_text_delta("[holoProxy Recovery Injected]");
+                    self.close_text();
+                    let tool_id = gen_tool_id();
+                    self.open_tool(&tool_id, &target_name);
+                    let args_str =
+                        serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".into());
+                    self.send_tool_delta(&args_str);
+                    self.close_tool();
+                }
             }
         }
 

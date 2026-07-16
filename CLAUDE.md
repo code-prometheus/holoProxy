@@ -72,20 +72,32 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 
 #### 4. 自动恢复机制 (`recovery.rs`)
 
-**核心原则：宁可乱杀不能错过。** agent 模式下只要没有 tool_use，无条件注入 fake tool，不依赖 LLM 语义判断是否触发。后果是宁可注入假的 tool_use 让 Claude Code 继续，也绝不能让它因无 tool_use 报 API Error 退出。
+**核心：硬编码拦截 + LLM 语义判断双保险。** agent 模式下无 tool_use 时，硬编码匹配 API 错误/超时关键词快速拦截，匹配不到再调用 LLM 语义判断是否正常结束。LLM 判断为 COMPLETE（总结、提问、等待用户操作等）不注入，确保正常对话不被误杀。
 
-**恢复入口**：
-- `finish()`：agent 模式 + 无 tool_use → 直接注入 fake tool
-- `send_error()`：agent 模式 + 无 tool_use → 直接注入 fake tool（重试耗尽后的错误响应）
+**两路恢复入口**：
+- `finish()`：硬编码拦截 → LLM 语义判断 → 按需注入 fake tool
+- `send_error()`：重试耗尽后无条件注入 fake tool（走到这里的必然是异常）
 
-**恢复动作**（`pick_recovery_tool()`）：
+**should_recover() 判断流程**：
+1. `stop_reason == "length"` → 直接触发
+2. 包含 `[holoProxy Recovery/Error]` → 跳过（防死循环）
+3. 硬编码匹配 14 种关键词（`timed out`, `empty or malformed response`, `api error`, `502/503/504`, `gateway`, `connection`, `unreachable` 等）→ 直接触发
+4. 空文本/纯空白 → 直接触发
+5. 以上都不满足 → LLM 语义判断（独立线程 + tokio runtime）
+
+**LLM 判断 ask_llm_if_incomplete()**：
+- 截取文本尾部 ~1500 字节发送给下游 LLM
+- Prompt 定义三类场景：
+  - NORMAL STOP — 自然结束、总结、提问、等待用户操作 → COMPLETE
+  - API/NETWORK ERROR — HTTP 错误、超时、网关异常等系统错误文本 → INCOMPLETE
+  - ABNORMAL CUT-OFF — 中途截断、半句话、未闭合代码块 → INCOMPLETE
+- 判断结果计入日志 `[Recovery] LLM 判断结果: COMPLETE/INCOMPLETE`
+- 仅 INCOMPLETE 触发恢复
+
+**恢复动作 pick_recovery_tool()**：
 - 优先选取 Bash/Shell/RunCommand/Execute 等无害工具
-- 注入跨平台兼容命令：`echo "Fake tool calling ..." && pwd && ls -la || cd && dir`
-- 向 Claude Code 发送 `[holoProxy Recovery Injected]` 标记文本
-
-**LLM 语义判断**（`should_recover()` / `ask_llm_if_incomplete()`）：
-- 当前保留但暂不使用，以备将来需要精细判断的场景
-- 硬编码关键词拦截仍保留用于单元测试验证
+- 注入跨平台命令：`echo "Fake tool calling ..." && pwd && ls -la || cd && dir`
+- 标记：`[holoProxy Recovery Injected]`
 
 #### 5. HTTP 代理模块 (`server.rs`)
 - 监听 `127.0.0.1:5430`
