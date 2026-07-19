@@ -3,7 +3,7 @@ use tracing::{info, warn};
 use std::sync::OnceLock;
 use regex::Regex;
 
-// ================= 1. 纯文本清洗 =================
+// ==================== Text Cleaning ====================
 static RE_BLANK: OnceLock<Regex> = OnceLock::new();
 static RE_NEWLINES: OnceLock<Regex> = OnceLock::new();
 static RE_CTRL: OnceLock<Regex> = OnceLock::new();
@@ -13,28 +13,28 @@ fn clean_text(text: &str) -> String {
     let re_blank = RE_BLANK.get_or_init(|| Regex::new(r"[ \t]+").unwrap());
     let re_newlines = RE_NEWLINES.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
     
-    // 1. 控制字符替换为单空格（防止单词粘连）
+    // 1. Replace control characters with single space (prevents word merging)
     let t = re_ctrl.replace_all(text, " ");
-    // 2. 【修复】连续空格/制表符压缩为 1 个空格（极致省 Token，避免 Markdown 硬换行）
+    // 2. Compress consecutive spaces/tabs to single space (saves tokens, avoids Markdown line breaks)
     let t = re_blank.replace_all(&t, " ");
     // 3. 3个及以上换行压缩为 2 个（保留段落间距）
     re_newlines.replace_all(&t, "\n\n").trim().to_string()
 }
 
-/// 清洗消息列表，输出压缩比：chars + tokens 变化
+/// Cleans message list and logs compression ratio (chars + tokens)
 pub fn clean_messages(messages: &mut Vec<OpenAIMessage>) {
     let chars_before: usize = messages.iter()
         .map(|m| m.content.as_deref().unwrap_or("").len()).sum();
     let before = estimate_token_count(messages);
 
     for msg in messages.iter_mut() {
-        // ✅ 安全：只清洗纯文本的 content
+        // Safe: only cleans text content
         if let Some(ref content) = msg.content {
             msg.content = Some(clean_text(content));
         }
         
-        // ❌ 移除对 tool_calls.arguments 的清洗，因为它是 JSON，正则清洗会破坏其内部值的语义（如代码换行、特定空格）
-        // 如果 arguments 里有脏数据，应该由下游工具在解析 JSON 后自行处理，而不是在 Prompt 层面破坏 JSON 结构。
+        // Do not clean tool_calls.arguments (JSON would be corrupted by regex)
+        // Dirty data in arguments should be handled downstream after JSON parsing
     }
 
     let chars_after: usize = messages.iter()
@@ -47,8 +47,8 @@ pub fn clean_messages(messages: &mut Vec<OpenAIMessage>) {
     }
 }
 
-// ================= 2. 解析与估算 =================
-// ... (保持你原来的 parse_context_length 和 estimate_tokens 不变，写得很好) ...
+// ==================== Parsing & Estimation ====================
+// Original parsing and estimation functions preserved
 pub fn parse_context_length(s: &str) -> usize {
     let s = s.trim().to_lowercase();
     if let Some(num) = s.strip_suffix('m') {
@@ -87,8 +87,8 @@ pub fn estimate_token_count(messages: &[OpenAIMessage]) -> usize {
     messages.iter().map(estimate_single_msg_tokens).sum()
 }
 
-// ================= 3. 超时与裁剪 =================
-// ... (保持你原来的 calc_timeout_secs, should_trim, trim_messages 不变) ...
+// ==================== Timeout & Trimming ====================
+// Original timeout and trimming functions preserved.
 pub fn calc_timeout_secs(body_bytes: usize) -> u64 {
     ((body_bytes as f64 / 200_000.0 * 60.0) as u64).max(60)
 }
@@ -130,14 +130,14 @@ pub fn trim_messages(messages: &mut Vec<OpenAIMessage>, max_context: usize) {
     }
 }
 
-// ================= 4. 单元测试 =================
+// ==================== Unit Tests ====================
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_clean_text_safety() {
-        // 测试控制字符和多余空格
+        // Test control characters and extra whitespace
         let dirty = "Hello\x00\x01   \t\tworld.\n\n\n\n\nTest.";
         let clean = clean_text(dirty);
         assert_eq!(clean, "Hello world.\n\nTest.");

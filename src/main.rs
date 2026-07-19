@@ -12,8 +12,9 @@ mod types;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-// 自定义时间格式：简化为 HH:MM:SS，无颜色
+/// Custom timestamp formatter for logs (HH:MM:SS, no color)
 struct SimpleTimer;
+
 impl tracing_subscriber::fmt::time::FormatTime for SimpleTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         let now = chrono::Local::now();
@@ -21,6 +22,7 @@ impl tracing_subscriber::fmt::time::FormatTime for SimpleTimer {
     }
 }
 
+/// Returns the path to the log file (next to executable)
 fn log_path() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         exe.parent().unwrap_or(std::path::Path::new(".")).join("holoProxy.log")
@@ -29,14 +31,16 @@ fn log_path() -> std::path::PathBuf {
     }
 }
 
-fn main() {
-    // 每次启动清空日志
-    let lp = log_path();
-    let _ = std::fs::write(&lp, "");
+/// Initializes file-based logging with custom formatting
+fn init_logging() {
+    let log_file = log_path();
+    
+    // Clear log file on each startup
+    let _ = std::fs::write(&log_file, "");
 
     let file_appender = tracing_appender::rolling::never(
-        lp.parent().unwrap_or(std::path::Path::new(".")),
-        lp.file_name().unwrap_or(std::ffi::OsStr::new("holoProxy.log")),
+        log_file.parent().unwrap_or(std::path::Path::new(".")),
+        log_file.file_name().unwrap_or(std::ffi::OsStr::new("holoProxy.log")),
     );
 
     tracing_subscriber::fmt()
@@ -46,33 +50,44 @@ fn main() {
         .with_target(false)
         .with_writer(file_appender)
         .init();
+}
 
-    info!("🚀 holoProxy v{} starting...", env!("CARGO_PKG_VERSION"));
-    info!("📋 port: 127.0.0.1:5430");
-
-    match config::get_active_llm_config() {
-        Some(c) => info!("✅ active LLM: {} ({})", config::get_active_llm_name(), c.model_name),
-        None => info!("⚠️ no LLM configured"),
-    }
-
-    // 后台线程跑 tokio + axum
-    let http_thread = std::thread::spawn(|| {
+/// Spawns the HTTP server in a background thread
+fn spawn_http_server() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("tokio runtime");
+            .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
             let app = server::create_router();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:5430")
                 .await
-                .expect("port 5430");
+                .expect("Failed to bind to port 5430");
             info!("HTTP server ready: http://127.0.0.1:5430");
             axum::serve(listener, app).await.unwrap();
         });
-    });
+    })
+}
 
-    // 主线程跑 tray
+fn main() {
+    init_logging();
+
+    info!("🚀 holoProxy v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!("📋 Listening on: 127.0.0.1:5430");
+
+    match config::get_active_llm_config() {
+        Some(c) => info!("✅ Active LLM: {} ({})", config::get_active_llm_name(), c.model_name),
+        None => info!("⚠️ No LLM configured"),
+    }
+
+    // Start HTTP server in background thread
+    let http_thread = spawn_http_server();
+
+    // Run system tray in main thread (blocks until exit)
     tray::run_tray();
+    
+    // Wait for HTTP server thread to finish (unlikely unless error)
     let _ = http_thread.join();
 }
