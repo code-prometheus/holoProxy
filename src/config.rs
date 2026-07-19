@@ -3,7 +3,8 @@ use indexmap::IndexMap;
 use std::path::PathBuf;
 use tracing::{error, info};
 
-// 查找配置文件的真实路径
+/// Lazily-initialized path to the settings configuration file.
+/// Searches in order: executable directory, assets/, then current directory.
 static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent().unwrap_or(std::path::Path::new(".")).join("settings.json");
@@ -14,9 +15,8 @@ static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::ne
     PathBuf::from("settings.json")
 });
 
-// [修改] 移除了容易导致状态过期并错误覆盖本地文件的 static SETTINGS 全局内存缓存
-
 impl Settings {
+    /// Creates a default configuration with a single local LLM entry
     fn default_config() -> Self {
         let mut llms = IndexMap::new();
         llms.insert(
@@ -36,10 +36,11 @@ impl Settings {
         Settings { active_llm: "默认本地大模型".into(), llms }
     }
 
+    /// Loads settings from disk, creating defaults if file doesn't exist or is invalid
     pub fn load() -> Self {
         let path = SETTINGS_PATH.as_path();
         if !path.exists() {
-            info!("generating default config: {}", path.display());
+            info!("Generating default config: {}", path.display());
             let d = Self::default_config();
             let _ = d.save_to(path);
             return d;
@@ -47,16 +48,18 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(data) => match serde_json::from_str::<Settings>(&data) {
                 Ok(cfg) => cfg,
-                Err(e) => { error!("config parse error: {} — using default", e); Self::default_config() }
+                Err(e) => { error!("Config parse error: {} — using default", e); Self::default_config() }
             },
-            Err(e) => { error!("config read error: {} — using default", e); Self::default_config() }
+            Err(e) => { error!("Config read error: {} — using default", e); Self::default_config() }
         }
     }
 
+    /// Persists current settings to disk
     pub fn save(&self) {
         let _ = self.save_to(SETTINGS_PATH.as_path());
     }
 
+    /// Saves settings to a specific path
     fn save_to(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(path, data)?;
@@ -64,15 +67,18 @@ impl Settings {
     }
 }
 
+/// Returns all configured LLM names
 pub fn get_llm_names() -> Vec<String> {
     Settings::load().llms.keys().cloned().collect()
 }
 
+/// Returns the name of the currently active LLM
 pub fn get_active_llm_name() -> String {
-    // [修改] 直接从磁盘获取，保证状态永远是最新
+    // Always loads fresh from disk to ensure latest state
     Settings::load().active_llm
 }
 
+/// Returns the configuration of the active LLM, if available
 pub fn get_active_llm_config() -> Option<LLMConfig> {
     let s = Settings::load();
     let key = &s.active_llm;
@@ -83,9 +89,9 @@ pub fn get_active_llm_config() -> Option<LLMConfig> {
     })
 }
 
+/// Switches the active LLM to the specified name
 pub fn switch_active_llm(name: &str) -> Result<(), String> {
-    // [修改] 先从磁盘 load 最新配置，然后在此基础上修改 active_llm 再保存
-    // 这样就不会因为内存数据过期而覆盖掉用户手动修改的参数 (比如 context_max_length)
+    // Loads fresh config from disk before modifying to avoid stale state
     let mut s = Settings::load();
     
     if !s.llms.contains_key(name) {
@@ -93,6 +99,6 @@ pub fn switch_active_llm(name: &str) -> Result<(), String> {
     }
     s.active_llm = name.to_string();
     s.save();
-    info!("switch LLM → {}", name);
+    info!("Switched active LLM → {}", name);
     Ok(())
 }

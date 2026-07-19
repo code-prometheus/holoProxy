@@ -2,7 +2,7 @@ use crate::types::*;
 
 const TOOLS_INSTRUCTION: &str = "\n\n[Tools Instruction]\nIf you cannot use Native API function calling, output EXACTLY:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"val\"}}\n</tool_call>";
 
-/// 清洗历史消息中的恢复标记
+/// Removes recovery markers from message history
 pub fn clean_recovery_garbage(text: &str) -> String {
     if text.contains("[holoProxy Recovery") {
         "(Previous auto-recovery signal omitted to save context)".into()
@@ -11,12 +11,12 @@ pub fn clean_recovery_garbage(text: &str) -> String {
     }
 }
 
-/// Anthropic 请求 → OpenAI Chat Completions 请求
+/// Converts an Anthropic API request to OpenAI Chat Completions format
 pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMConfig) -> OpenAIRequest {
     let mut openai_req = OpenAIRequest {
         model: llm_config.model_name.clone(),
         messages: Vec::new(),
-        stream: true, // 强制流式，防止下游 LLM 非流式导致超时
+        stream: true, // Force streaming to prevent timeouts from non-streaming downstream LLMs
         tools: None,
         max_tokens: anthropic_req.max_tokens.map(|mt| mt.min(8192)),
         temperature: anthropic_req.temperature,
@@ -24,7 +24,7 @@ pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMC
         stop: anthropic_req.stop_sequences.as_ref().map(|s| s.iter().take(4).cloned().collect()),
     };
 
-    // 转换 tools
+    // Convert tools from Anthropic format to OpenAI format
     if !anthropic_req.tools.is_empty() {
         openai_req.tools = Some(
             anthropic_req.tools.iter().map(|t| {
@@ -45,7 +45,7 @@ pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMC
         );
     }
 
-    // 构建 system prompt
+    // Build system prompt from Anthropic request
     let mut system_content = match &anthropic_req.system {
         Some(SystemPrompt::String(s)) => s.clone(),
         Some(SystemPrompt::Blocks(blocks)) => blocks.iter()
@@ -56,7 +56,7 @@ pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMC
         None => String::new(),
     };
 
-    // 仅当模型不支持原生 function calling 时才注入 Tools Instruction
+    // Inject Tools Instruction only when model does not support native function calling
     if !anthropic_req.tools.is_empty() && !llm_config.supports_native_function_calling {
         system_content.push_str(TOOLS_INSTRUCTION);
     }
@@ -68,7 +68,7 @@ pub fn convert_to_openai_req(anthropic_req: &AnthropicRequest, llm_config: &LLMC
         });
     }
 
-    // 转换 messages
+    // Convert messages from Anthropic to OpenAI format
     for msg in &anthropic_req.messages {
         convert_message(msg, &mut openai_req.messages);
     }
@@ -203,7 +203,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(), model_name: "test".into(),
             context_max_length: "200k".into(), verify_ssl: false, api_key: "none".into(),
             auth_header: "Authorization".into(), auth_prefix: "Bearer ".into(),
-            supports_native_function_calling: false, // 测试默认走 XML tools instruction
+            supports_native_function_calling: false, // Test with XML tools instruction (native function calling disabled)
             supports_reasoning_content: false,
         }
     }
