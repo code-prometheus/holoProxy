@@ -16,7 +16,7 @@ holoProxy — 用 Rust 重写的 Claude Code API 代理。核心目标：将 Cla
 - **序列化**: serde + serde_json
 - **Windows 托盘**: tray-icon + winit
 - **配置**: serde_json 读写 JSON 配置文件
-- **日志**: tracing + tracing-subscriber
+- **日志**: tracing + tracing-subscriber + tracing-appender
 
 ## 核心架构
 
@@ -55,7 +55,7 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 - messages 内容块转换（user/assistant/tool_result → OpenAI 格式）
 - **Tools Instruction 注入**：对不支持原生 function calling 的模型，在 system prompt 末尾注入 XML 格式工具调用指令
 - 每次请求的 context 长度和信息条数记入 log
-- 上下文超过 LLM 配置 context_max_length 的 75% 时自动裁剪
+- 上下文超过 LLM 配置 context_max_length 的 80% 时自动裁剪
 - 恢复信号清洗：替换 `[holoProxy Recovery ...]` 为压缩文本
 
 #### 3. SSE 流处理模块 (`stream.rs`)
@@ -81,12 +81,12 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 **should_recover() 判断流程**：
 1. `stop_reason == "length"` → 直接触发
 2. 包含 `[holoProxy Recovery/Error]` → 跳过（防死循环）
-3. 硬编码匹配 14 种关键词（`timed out`, `empty or malformed response`, `api error`, `502/503/504`, `gateway`, `connection`, `unreachable` 等）→ 直接触发
+3. 硬编码匹配 17 种关键词（`timed out`, `empty or malformed response`, `api error`, `502/503/504`, `gateway`, `connection refused`, `connection reset`, `network error`, `request failed` 等）→ 直接触发
 4. 空文本/纯空白 → 直接触发
 5. 以上都不满足 → LLM 语义判断（独立线程 + tokio runtime）
 
 **LLM 判断 ask_llm_if_incomplete()**：
-- 截取文本尾部 ~1500 字节发送给下游 LLM
+- 截取文本尾部 ~2000 字节发送给下游 LLM
 - Prompt 定义三类场景：
   - NORMAL STOP — 自然结束、总结、提问、等待用户操作 → COMPLETE
   - API/NETWORK ERROR — HTTP 错误、超时、网关异常等系统错误文本 → INCOMPLETE
@@ -116,8 +116,8 @@ cargo build --release
 cargo run
 cargo test
 cargo test -- --nocapture
-cargo check      # 仅类型检查
-cargo clippy     # Lint 检查
+cargo check # 仅类型检查
+cargo clippy # Lint 检查
 ```
 
 Release 输出：`target/release/holo_proxy.exe`
@@ -127,23 +127,23 @@ Release 输出：`target/release/holo_proxy.exe`
 `settings.json`（与 proxy-bridge 格式兼容）：
 ```json
 {
- "active_llm": "DeepSeek V4",
- "llms": {
- "DeepSeek V4": {
- "base_url": "http://xxx:8000/v1",
- "model_name": "dsv4",
- "context_max_length": "1m",
- "api_key": "none"
- }
- }
+  "active_llm": "DeepSeek V4",
+  "llms": {
+    "DeepSeek V4": {
+      "base_url": "http://xxx:8000/v1",
+      "model_name": "dsv4",
+      "context_max_length": "1m",
+      "api_key": "none"
+    }
+  }
 }
 ```
 
 ## 注意事项
 
 - 参考 proxy-bridge 时仅关注 Claude Code 接口逻辑，忽略 Chrome 扩展等无关功能
-- 对下游 LLM 的 SSL 证书验证默认忽略（`danger_accept_invalid_certs: true`）
+- 对下游 LLM 的 SSL 证书验证默认忽略（`danger_accept_invalid_certs: true`）。配置中的 `verify_ssl` 字段默认为 `true` 但实际发送请求时固定关闭验证
 - 下游 API 返回错误时，返回 200 + 包含错误信息的 SSE 流，而非直接返回 5xx
 - 恢复机制注入的命令必须跨平台兼容（Windows cmd + Linux/Mac bash）
 - 下游 LLM 连接失败时静默重试 3 次（每次新建 Client）
-- 每次重试都用 `fresh_client()` 新建 `reqwest::Client`（`pool_max_idle_host=0`）
+- 每次重试都用 `fresh_client()` 新建 `reqwest::Client`（`pool_max_idle_per_host=0`）

@@ -19,7 +19,7 @@
 
 ### 1. 下载
 
-从 [Releases](https://github.com/code-prometheus/holoProxy/releases) 下载最新 `holoProxy-windows-x64.tar.gz`。
+从 [Releases](https://github.com/code-prometheus/holoProxy/releases) 下载最新 `holoProxy-windows-x64.zip`。
 
 ### 2. 配置
 
