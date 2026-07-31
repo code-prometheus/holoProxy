@@ -454,8 +454,7 @@ async fn forward_raw_sse(
     let mut stream = response.bytes_stream();
     let mut has_any_data = false;
     let mut first_token = true;
-    let mut reasoning_buf = String::new();
-    let mut content_seen = false;
+    let mut reasoning_open = false;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -466,7 +465,6 @@ async fn forward_raw_sse(
                     info!("[rsp {}] first_token in {:.1}s chunk={}B", msg_id, req_start.elapsed().as_secs_f64(), chunk.len());
                 }
                 has_any_data = true;
-                // 解析 SSE，reasoning 累积到 buffer，首 content 前置 <thinking> 标签
                 let text = String::from_utf8_lossy(&chunk);
                 let mut modified = String::with_capacity(text.len() + 128);
                 for line in text.lines() {
@@ -482,19 +480,18 @@ async fn forward_raw_sse(
                     }
                     let data_str = trimmed[6..].trim();
                     if data_str == "[DONE]" {
-                        // flush residual reasoning buffer
-                        if !reasoning_buf.is_empty() {
-                            let content_json = serde_json::to_string(&format!("<thinking>{}</thinking>", reasoning_buf)).unwrap_or_default();
+                        // 如果 reasoning 未关闭，先补 </thinking>
+                        if reasoning_open {
+                            let close_json = serde_json::to_string("</thinking>").unwrap_or_default();
                             modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
-                            modified.push_str(&content_json);
+                            modified.push_str(&close_json);
                             modified.push_str("}}]}\n\n");
-                            info!("[rsp {}] 💭 reasoning flushed at DONE ({}B)", msg_id, reasoning_buf.len());
-                            reasoning_buf.clear();
+                            info!("[rsp {}] 💭 reasoning END at DONE", msg_id);
+                            reasoning_open = false;
                         }
                         modified.push_str("data: [DONE]\n\n");
                         continue;
                     }
-                    // 解析为OpenAI SSE chunk
                     let parsed: serde_json::Value = match serde_json::from_str(data_str) {
                         Ok(v) => v,
                         Err(_) => { modified.push_str(trimmed); modified.push('\n'); continue; }
@@ -506,29 +503,35 @@ async fn forward_raw_sse(
                     let content_text = delta["content"].as_str().unwrap_or("");
 
                     if !reasoning_text.is_empty() {
-                        if reasoning_buf.is_empty() {
+                        if !reasoning_open {
+                            // 首个 reasoning：发 <thinking> 标签 + 内容
                             info!("[rsp {}] 💭 reasoning START", msg_id);
+                            let tagged = format!("<thinking>{}", reasoning_text);
+                            let tagged_json = serde_json::to_string(&tagged).unwrap_or_default();
+                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                            modified.push_str(&tagged_json);
+                            modified.push_str("}}]}\n\n");
+                            reasoning_open = true;
+                        } else {
+                            // 流式输出 reasoning
+                            info!("[rsp {}] 💭 reasoning delta", msg_id);
+                            let r_json = serde_json::to_string(&reasoning_text).unwrap_or_default();
+                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                            modified.push_str(&r_json);
+                            modified.push_str("}}]}\n\n");
                         }
-                        reasoning_buf.push_str(&reasoning_text);
-                        info!("[rsp {}] 💭 reasoning delta ({}B total)", msg_id, reasoning_buf.len());
                     }
 
                     if !content_text.is_empty() {
-                        if !content_seen {
-                            content_seen = true;
-                            // 首 content：前置 accumulated reasoning
-                            let final_content = if !reasoning_buf.is_empty() {
-                                let flush = std::mem::take(&mut reasoning_buf);
-                                info!("[rsp {}] 💭 reasoning flushed → 📝 content START (reasoning {}B)", msg_id, flush.len());
-                                format!("<thinking>{}</thinking>{}", flush, content_text)
-                            } else {
-                                info!("[rsp {}] 📝 content START", msg_id);
-                                content_text.to_string()
-                            };
-                            let content_json = serde_json::to_string(&final_content).unwrap_or_default();
+                        if reasoning_open {
+                            // reasoning → content 切换：先关 </thinking>
+                            info!("[rsp {}] 💭 reasoning END → 📝 content START", msg_id);
+                            let tagged = format!("</thinking>{}", content_text);
+                            let tagged_json = serde_json::to_string(&tagged).unwrap_or_default();
                             modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
-                            modified.push_str(&content_json);
+                            modified.push_str(&tagged_json);
                             modified.push_str("}}]}\n\n");
+                            reasoning_open = false;
                         } else {
                             info!("[rsp {}] 📝 content delta", msg_id);
                             modified.push_str(trimmed);
@@ -536,7 +539,7 @@ async fn forward_raw_sse(
                         }
                     }
 
-                    // 其他有 tool_calls 等的 delta：原样转发
+                    // tool_calls 等其他 delta 原样转发
                     if content_text.is_empty() && reasoning_text.is_empty() {
                         modified.push_str(trimmed);
                         modified.push('\n');
