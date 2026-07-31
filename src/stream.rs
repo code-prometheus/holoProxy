@@ -477,12 +477,12 @@ impl StreamContext {
     }
 }
 
-fn gen_tool_id() -> String {
+pub fn gen_tool_id() -> String {
     format!("toolu_{}", Uuid::new_v4().to_string().replace('-', "")[..24].to_string())
 }
 
-/// 解析 fallback XML/JSON 工具调用
-fn parse_fallback_tool(
+/// 解析 fallback XML/JSON 工具调用（公开，供 OpenAI 透传路径复用）
+pub fn parse_fallback_tool(
     text: &str,
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {

@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::config::{get_active_llm_name, get_llm_names};
 use crate::context::{calc_timeout_secs, parse_context_length};
 use crate::converter::convert_to_openai_req;
-use crate::stream::StreamContext;
+use crate::stream::{self, StreamContext};
 use crate::types::*;
 
 /// 每次重试都新建——确保不用已断开的TCP连接
@@ -455,6 +455,22 @@ async fn forward_raw_sse(
     let mut has_any_data = false;
     let mut first_token = true;
     let mut reasoning_open = false;
+    // 工具调用拦截缓冲区（复用 Anthropic 路径相同的逻辑）
+    let mut content_buf = String::new();
+    let mut intercept_active = false;
+    let mut intercept_buffer = String::new();
+    let mut active_close_tag = String::new();
+    // 触发标签集合（与 stream.rs 保持一致）
+    let mut triggers: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    triggers.insert("<tool_call>", "</tool_call>");
+    triggers.insert("```json", "```");
+    triggers.insert("```tool_call", "```");
+    triggers.insert("<DSML|tool_name>", "</DSML|tool_name>");
+    triggers.insert("<DSML|tool_calls>", "</DSML|tool_calls>");
+    triggers.insert("<|tool_calls|>", "</|tool_calls|>");
+    triggers.insert("<|tool_call|>", "</|tool_call|>");
+    triggers.insert("<ツtool_callsツ>", "</ツtool_callsツ>");
+    triggers.insert("<ツtool_callツ>", "</ツtool_callツ>");
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -480,7 +496,14 @@ async fn forward_raw_sse(
                     }
                     let data_str = trimmed[6..].trim();
                     if data_str == "[DONE]" {
-                        // 如果 reasoning 未关闭，先补 </thinking>
+                        // 流结束：flush content buffer + 关闭 reasoning
+                        if !content_buf.is_empty() {
+                            let buf_json = serde_json::to_string(&content_buf).unwrap_or_default();
+                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                            modified.push_str(&buf_json);
+                            modified.push_str("}}]}\n\n");
+                            content_buf.clear();
+                        }
                         if reasoning_open {
                             let close_json = serde_json::to_string("</thinking>").unwrap_or_default();
                             modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
@@ -501,10 +524,11 @@ async fn forward_raw_sse(
                     let reasoning_text = delta["reasoning"].as_str().unwrap_or("").to_string()
                         + delta["reasoning_content"].as_str().unwrap_or("");
                     let content_text = delta["content"].as_str().unwrap_or("");
+                    let has_tool_calls = !delta["tool_calls"].as_array().unwrap_or(&vec![]).is_empty();
 
+                    // 1. 处理 reasoning（流式输出，<thinking> 包裹）
                     if !reasoning_text.is_empty() {
                         if !reasoning_open {
-                            // 首个 reasoning：发 <thinking> 标签 + 内容
                             info!("[rsp {}] 💭 reasoning START", msg_id);
                             let tagged = format!("<thinking>{}", reasoning_text);
                             let tagged_json = serde_json::to_string(&tagged).unwrap_or_default();
@@ -513,7 +537,6 @@ async fn forward_raw_sse(
                             modified.push_str("}}]}\n\n");
                             reasoning_open = true;
                         } else {
-                            // 流式输出 reasoning
                             info!("[rsp {}] 💭 reasoning delta", msg_id);
                             let r_json = serde_json::to_string(&reasoning_text).unwrap_or_default();
                             modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
@@ -522,27 +545,177 @@ async fn forward_raw_sse(
                         }
                     }
 
-                    if !content_text.is_empty() {
-                        if reasoning_open {
-                            // reasoning → content 切换：先关 </thinking>
-                            info!("[rsp {}] 💭 reasoning END → 📝 content START", msg_id);
-                            let tagged = format!("</thinking>{}", content_text);
-                            let tagged_json = serde_json::to_string(&tagged).unwrap_or_default();
-                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
-                            modified.push_str(&tagged_json);
-                            modified.push_str("}}]}\n\n");
-                            reasoning_open = false;
-                        } else {
-                            info!("[rsp {}] 📝 content delta", msg_id);
-                            modified.push_str(trimmed);
-                            modified.push('\n');
-                        }
-                    }
-
-                    // tool_calls 等其他 delta 原样转发
-                    if content_text.is_empty() && reasoning_text.is_empty() {
+                    // 2. 处理 tool_calls（原样转发）
+                    if has_tool_calls {
                         modified.push_str(trimmed);
                         modified.push('\n');
+                        // 关闭 reasoning 防止干扰
+                        if reasoning_open {
+                            info!("[rsp {}] 💭 reasoning END → tool_calls", msg_id);
+                            reasoning_open = false;
+                        }
+                        continue;
+                    }
+
+                    // 3. 处理 content：缓冲 + XML/DSML 工具调用拦截
+                    if !content_text.is_empty() {
+                        if intercept_active {
+                            // 拦截模式：收集到 close_tag
+                            intercept_buffer.push_str(&content_text);
+                            if let Some(ci) = intercept_buffer.find(&active_close_tag) {
+                                let close_end = ci + active_close_tag.len();
+                                let full_xml = intercept_buffer[..close_end].to_string();
+                                let remaining = intercept_buffer[close_end..].to_string();
+
+                                // 尝试解析工具调用
+                                let (tool_name, tool_args) = stream::parse_fallback_tool(
+                                    &full_xml,
+                                    &std::collections::HashMap::new(),
+                                );
+                                if tool_name != "unknown" {
+                                    // 发 tool_call delta
+                                    let tool_id = stream::gen_tool_id();
+                                    let tc_json = serde_json::json!({
+                                        "choices": [{"delta": {"tool_calls": [{
+                                            "index": 0,
+                                            "id": tool_id,
+                                            "type": "function",
+                                            "function": {"name": tool_name, "arguments": serde_json::to_string(&tool_args).unwrap_or_default()}
+                                        }]}}]
+                                    });
+                                    modified.push_str("data: ");
+                                    modified.push_str(&serde_json::to_string(&tc_json).unwrap_or_default());
+                                    modified.push_str("\n\n");
+                                    info!("[rsp {}] 🔧 XML/DSML tool_call: {}", msg_id, tool_name);
+                                } else {
+                                    // 不是工具调用，作为普通 content 输出
+                                    warn!("[rsp {}] ⚠️ 拦截到无效标签，作为 content 输出", msg_id);
+                                    let pre_json = serde_json::to_string(&full_xml).unwrap_or_default();
+                                    modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                                    modified.push_str(&pre_json);
+                                    modified.push_str("}}]}\n\n");
+                                }
+
+                                intercept_active = false;
+                                intercept_buffer.clear();
+                                content_buf = remaining;
+                                if !content_buf.is_empty() {
+                                    // 检查剩余文本中是否有触发标签
+                                    let mut earliest_idx = None;
+                                    let mut matched_tag = None;
+                                    for (open_tag, _) in &triggers {
+                                        if let Some(idx) = content_buf.find(open_tag) {
+                                            if earliest_idx.is_none() || idx < earliest_idx.unwrap() {
+                                                earliest_idx = Some(idx);
+                                                matched_tag = Some(open_tag);
+                                            }
+                                        }
+                                    }
+                                    if let (Some(idx), Some(tag)) = (earliest_idx, matched_tag) {
+                                        // 又出现触发标签
+                                        let pre = content_buf[..idx].to_string();
+                                        if !pre.is_empty() {
+                                            // 发 content
+                                            let content_str = if reasoning_open {
+                                                format!("</thinking>{}", pre)
+                                            } else {
+                                                pre
+                                            };
+                                            if reasoning_open {
+                                                info!("[rsp {}] 💭 reasoning END → 📝 content", msg_id);
+                                                reasoning_open = false;
+                                            }
+                                            let c_json = serde_json::to_string(&content_str).unwrap_or_default();
+                                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                                            modified.push_str(&c_json);
+                                            modified.push_str("}}]}\n\n");
+                                        }
+                                        intercept_active = true;
+                                        active_close_tag = triggers.get(tag).unwrap_or(&"").to_string();
+                                        intercept_buffer = content_buf[idx..].to_string();
+                                        content_buf.clear();
+                                    } else {
+                                        // 正常 flush
+                                        let flush = std::mem::take(&mut content_buf);
+                                        if !flush.is_empty() {
+                                            let content_str = if reasoning_open {
+                                                format!("</thinking>{}", flush)
+                                            } else {
+                                                flush
+                                            };
+                                            if reasoning_open {
+                                                info!("[rsp {}] 💭 reasoning END → 📝 content", msg_id);
+                                                reasoning_open = false;
+                                            }
+                                            let c_json = serde_json::to_string(&content_str).unwrap_or_default();
+                                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                                            modified.push_str(&c_json);
+                                            modified.push_str("}}]}\n\n");
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // 非拦截模式：追加到 content buffer
+                            content_buf.push_str(&content_text);
+
+                            // 检查是否有触发标签
+                            let mut earliest_idx = None;
+                            let mut matched_tag = None;
+                            for (open_tag, _) in &triggers {
+                                if let Some(idx) = content_buf.find(open_tag) {
+                                    if earliest_idx.is_none() || idx < earliest_idx.unwrap() {
+                                        earliest_idx = Some(idx);
+                                        matched_tag = Some(open_tag);
+                                    }
+                                }
+                            }
+                            if let (Some(idx), Some(tag)) = (earliest_idx, matched_tag) {
+                                // 发 trigger 之前的文本
+                                if idx > 0 {
+                                    let pre = content_buf[..idx].to_string();
+                                    let content_str = if reasoning_open {
+                                        format!("</thinking>{}", pre)
+                                    } else {
+                                        pre
+                                    };
+                                    if reasoning_open {
+                                        info!("[rsp {}] 💭 reasoning END → 📝 content", msg_id);
+                                        reasoning_open = false;
+                                    }
+                                    let c_json = serde_json::to_string(&content_str).unwrap_or_default();
+                                    modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                                    modified.push_str(&c_json);
+                                    modified.push_str("}}]}\n\n");
+                                }
+                                intercept_active = true;
+                                active_close_tag = triggers.get(tag).unwrap_or(&"").to_string();
+                                intercept_buffer = content_buf[idx..].to_string();
+                                content_buf.clear();
+                            } else if content_buf.len() > 35 {
+                                // buffer 够大且无触发标签 → 发送
+                                let safe_cut = content_buf.len() - 35;
+                                let send_len = content_buf.floor_char_boundary(safe_cut);
+                                let send_text = content_buf[..send_len].to_string();
+                                if !send_text.is_empty() {
+                                    let content_str = if reasoning_open {
+                                        format!("</thinking>{}", send_text)
+                                    } else {
+                                        send_text
+                                    };
+                                    if reasoning_open {
+                                        info!("[rsp {}] 💭 reasoning END → 📝 content", msg_id);
+                                        reasoning_open = false;
+                                    }
+                                    info!("[rsp {}] 📝 content delta", msg_id);
+                                    let c_json = serde_json::to_string(&content_str).unwrap_or_default();
+                                    modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                                    modified.push_str(&c_json);
+                                    modified.push_str("}}]}\n\n");
+                                }
+                                content_buf = content_buf[send_len..].to_string();
+                            }
+                        }
                     }
                 }
                 if tx.send(Bytes::from(modified)).await.is_err() {
