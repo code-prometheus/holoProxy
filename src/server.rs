@@ -454,6 +454,8 @@ async fn forward_raw_sse(
     let mut stream = response.bytes_stream();
     let mut has_any_data = false;
     let mut first_token = true;
+    let mut reasoning_buf = String::new();
+    let mut content_seen = false;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -464,13 +466,12 @@ async fn forward_raw_sse(
                     info!("[rsp {}] first_token in {:.1}s chunk={}B", msg_id, req_start.elapsed().as_secs_f64(), chunk.len());
                 }
                 has_any_data = true;
-                // 解析 SSE chunk，reasoning 包 <thinking> 标签，其余原样转发
+                // 解析 SSE，reasoning 累积到 buffer，首 content 前置 <thinking> 标签
                 let text = String::from_utf8_lossy(&chunk);
-                let mut modified = String::with_capacity(text.len() + 64);
+                let mut modified = String::with_capacity(text.len() + 128);
                 for line in text.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
-                        // 保留空行（SSE 事件之间的分隔）
                         modified.push('\n');
                         continue;
                     }
@@ -481,44 +482,62 @@ async fn forward_raw_sse(
                     }
                     let data_str = trimmed[6..].trim();
                     if data_str == "[DONE]" {
+                        // flush residual reasoning buffer
+                        if !reasoning_buf.is_empty() {
+                            let content_json = serde_json::to_string(&format!("<thinking>{}</thinking>", reasoning_buf)).unwrap_or_default();
+                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                            modified.push_str(&content_json);
+                            modified.push_str("}}]}\n\n");
+                            info!("[rsp {}] 💭 reasoning flushed at DONE ({}B)", msg_id, reasoning_buf.len());
+                            reasoning_buf.clear();
+                        }
                         modified.push_str("data: [DONE]\n\n");
                         continue;
                     }
-                    if let Ok(c) = serde_json::from_str::<crate::types::OpenAISseChunk>(data_str) {
-                        let mut has_reasoning = false;
-                        for choice in &c.choices {
-                            if let Some(ref d) = choice.delta {
-                                if let Some(ref r) = d.reasoning { if !r.is_empty() { has_reasoning = true; } }
-                                if let Some(ref r) = d.reasoning_content { if !r.is_empty() { has_reasoning = true; } }
-                            }
+                    // 解析为OpenAI SSE chunk
+                    let parsed: serde_json::Value = match serde_json::from_str(data_str) {
+                        Ok(v) => v,
+                        Err(_) => { modified.push_str(trimmed); modified.push('\n'); continue; }
+                    };
+                    let delta = &parsed["choices"][0]["delta"];
+
+                    let reasoning_text = delta["reasoning"].as_str().unwrap_or("").to_string()
+                        + delta["reasoning_content"].as_str().unwrap_or("");
+                    let content_text = delta["content"].as_str().unwrap_or("");
+
+                    if !reasoning_text.is_empty() {
+                        if reasoning_buf.is_empty() {
+                            info!("[rsp {}] 💭 reasoning START", msg_id);
                         }
-                        if has_reasoning {
-                            let mut json_val: serde_json::Value = serde_json::from_str(data_str).unwrap_or_default();
-                            if let Some(choices) = json_val["choices"].as_array_mut() {
-                                for choice in choices {
-                                    if let Some(delta) = choice["delta"].as_object_mut() {
-                                        let mut thinking_text = String::new();
-                                        if let Some(r) = delta.remove("reasoning") {
-                                            if let Some(s) = r.as_str() { thinking_text.push_str(s); }
-                                        }
-                                        if let Some(r) = delta.remove("reasoning_content") {
-                                            if let Some(s) = r.as_str() { thinking_text.push_str(s); }
-                                        }
-                                        if !thinking_text.is_empty() {
-                                            let existing = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                            delta.insert("content".into(), serde_json::json!(format!("{}<thinking>{}</thinking>", existing, thinking_text)));
-                                        }
-                                    }
-                                }
-                            }
-                            modified.push_str("data: ");
-                            modified.push_str(&serde_json::to_string(&json_val).unwrap_or_default());
-                            modified.push_str("\n\n");
+                        reasoning_buf.push_str(&reasoning_text);
+                        info!("[rsp {}] 💭 reasoning delta ({}B total)", msg_id, reasoning_buf.len());
+                    }
+
+                    if !content_text.is_empty() {
+                        if !content_seen {
+                            content_seen = true;
+                            // 首 content：前置 accumulated reasoning
+                            let final_content = if !reasoning_buf.is_empty() {
+                                let flush = std::mem::take(&mut reasoning_buf);
+                                info!("[rsp {}] 💭 reasoning flushed → 📝 content START (reasoning {}B)", msg_id, flush.len());
+                                format!("<thinking>{}</thinking>{}", flush, content_text)
+                            } else {
+                                info!("[rsp {}] 📝 content START", msg_id);
+                                content_text.to_string()
+                            };
+                            let content_json = serde_json::to_string(&final_content).unwrap_or_default();
+                            modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+                            modified.push_str(&content_json);
+                            modified.push_str("}}]}\n\n");
                         } else {
+                            info!("[rsp {}] 📝 content delta", msg_id);
                             modified.push_str(trimmed);
                             modified.push('\n');
                         }
-                    } else {
+                    }
+
+                    // 其他有 tool_calls 等的 delta：原样转发
+                    if content_text.is_empty() && reasoning_text.is_empty() {
                         modified.push_str(trimmed);
                         modified.push('\n');
                     }
