@@ -47,6 +47,7 @@ jobs:
           mkdir artifact/assets
           copy assets/icon.ico artifact/assets/
           copy settings.json artifact/
+          copy README.md artifact/
           Compress-Archive -Path artifact/* -DestinationPath holoProxy-windows-x64.zip
 
       - name: Upload artifact

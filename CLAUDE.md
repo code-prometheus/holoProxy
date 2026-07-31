@@ -1,22 +1,31 @@
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## 项目概述
 
-holoProxy — 用 Rust 重写的 Claude Code API 代理。核心目标：将 Claude Code 的 Anthropic API 请求 (`/v1/messages`) 转换为任意下游 LLM 的 OpenAI 兼容 API 格式，实现流式响应和工具调用的透明代理。最终编译为 Windows 托盘应用，右键可切换下游模型。
+holoProxy — 用 Rust 重写的 Claude Code API 代理。核心目标：将 Claude Code 的 Anthropic API 请求 (`/v1/messages`) 转换为任意下游 LLM 的 OpenAI 兼容 API 格式，实现流式响应和工具调用的透明代理。同时提供 OpenAI 透 (`/v1/chat/completions`)。最终编译为 Windows 托盘应用，右键可切换下游模型。
 
 参考项目：`F:\AIQuantTrade\proxy-bridge`（Python 实现，仅复刻其 Claude Code 接口部分）。
 
 ## 技术栈
 
-- **语言**: Rust (stable)
-- **HTTP 框架**: axum (基于 tokio/tower)
+- **语言**: Rust (HTTP 框架**: axum (基于 tokio/tower)
 - **HTTP 客户端**: reqwest (异步，支持流式 SSE)
 - **序列化**: serde + serde_json
 - **Windows 托盘**: tray-icon + winit
 - **配置**: serde_json 读写 JSON 配置文件
 - **日志**: tracing + tracing-subscriber + tracing-appender
+
+## API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/v1/messages` | Anthropic Messages API → 转换为 OpenAI 格式后转发下游 |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions API — 直接透传（reasoning 包 `<thinking>` 标签） |
+| GET | `/v1/models` | 获取当前激活模型及可用模型列表 |
+| POST | `/v1/select_model` | 运行时切换激活模型 |
 
 ## 核心架构
 
@@ -29,17 +38,35 @@ Claude Code (客户端)
 holoProxy (127.0.0.1:5430)
  │ 1. 解析 Anthropic 请求体 (model, messages, tools, stream, system)
  │ 2. 转换为 OpenAI Chat Completions 格式
- │ 3. 注入 Tools Instruction
- │ 4. 发送到下游 LLM
+ │ 3. 注入 Tools Instruction（对不支持原生 function calling 的模型）
+ │ 4. context 裁剪 + 清理
+ │ 5. 注入 chat_template_kwargs （thinking/reasoning_effort/stream）
+ │ 6. 发送到下游 LLM
  ▼
 下游 LLM (OpenAI 兼容 API)
  │ SSE 流式响应 或 非流式 JSON
  ▼
 holoProxy 解析响应
- │ 流式：SSE 状态机 → Anthropic SSE 事件
+ │ 流式：SSE 状态机 → Anthropic SSE 事件（含 thinking content_block）
  │ 非流式：JSON → Anthropic 响应格式
  ▼
 Claude Code (客户端收到标准 Anthropic SSE/JSON)
+```
+
+### OpenAI 透传流程
+
+```
+任意 OpenAI 客户端
+ │ POST /v1/chat/completions (OpenAI 格式)
+ ▼
+holoProxy (127.0.0.1:5430)
+ │ 1. 注入 chat_template_kwargs + stream:true
+ │ 2. 直接转发到下游 LLM
+ ▼
+下游 LLM → SSE 流
+ │ reasoning 字段包 <thinking> 标签 → content 字段
+ ▼
+客户端 (收到标准 OpenAI SSE，reasoning 转为 content 内 <thinking> 标签)
 ```
 
 ### 关键模块设计
@@ -61,14 +88,16 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 #### 3. SSE 流处理模块 (`stream.rs`)
 核心 SSE 状态机，将 OpenAI 格式 SSE 流转换为 Anthropic 格式 SSE 流。
 
-状态转换：`message_start` → `content_block_start (text)` → `content_block_delta` → … → `content_block_stop` → `content_block_start (tool_use)` → `content_block_delta (input_json_delta)` → … → `content_block_stop` → `message_delta` + `message_stop`
+状态转换：`message_start` → `content_block_start (thinking)` → `content_block_delta` → ... → `content_block_stop` → `content_block_start (text)` → `content_block_delta` → ... → `content_block_stop` → `content_block_start (tool_use)` → `content_block_delta (input_json_delta)` → ... → `content_block_stop` → `message_delta` + `message_stop`
 
 关键逻辑：
+- **reasoning 处理**：下游 `delta.reasoning` / `delta.reasoning_content` → 独立 Anthropic thinking content_block
 - **原生 tool_calls 处理**：下游返回 `delta.tool_calls[]` 时，按 index 追踪，输出 Anthropic tool_use 事件
 - **XML 工具调用拦截**：下游在 content 文本中输出 `<tool_call>...</tool_call>` XML 时，拦截并转换为正式 tool_use 事件
 - **Fallback 解析**：DSML 标签、JSON 块、MD 代码块等多种格式的工具调用尝试解析
 - **finish_reason 映射**：`tool_calls`/stop/length → `stop_reason: "tool_use"` 或 `"end_turn"`
 - **错误恢复**：`send_error()` 在 agent 模式下直接注入 fake tool，防止 Claude Code 因无 tool_use 响应报 API Error
+- **thinking 块自动切换**：`ensure_text_open` / `open_tool` 自动关闭 thinking 块
 
 #### 4. 自动恢复机制 (`recovery.rs`)
 
@@ -101,9 +130,11 @@ Claude Code (客户端收到标准 Anthropic SSE/JSON)
 
 #### 5. HTTP 代理模块 (`server.rs`)
 - 监听 `127.0.0.1:5430`
-- 路由：`POST /v1/messages`、`GET /v1/models`、`POST /v1/select_model`
+- 路由：`POST /v1/messages`、`POST /v1/chat/completions`、`GET /v1/models`、`POST /v1/select_model`
+- **请求注入**：两条路由发送前统一注入 `chat_template_kwargs`（`thinking: true, reasoning_effort: "max"`）和 `stream: true`
 - 重连机制：每次重试新建 `reqwest::Client`（`pool_max_idle_per_host=0`）
 - 日志格式 `[msg_id] attempt=N/3 remaining=M url=... http=STATUS in=X.Xs`
+- **OpenAI 透传**：`forward_raw_sse` 解析 SSE chunk，reasoning 字段 → `<thinking>` 标签包裹后合并到 content
 
 #### 6. Windows 托盘模块 (`tray.rs`)
 - 系统托盘图标 + 右键菜单列出所有 LLM（激活标记 ✓）
@@ -127,9 +158,9 @@ Release 输出：`target/release/holo_proxy.exe`
 `settings.json`（与 proxy-bridge 格式兼容）：
 ```json
 {
-  "active_llm": "DeepSeek V4",
+  "active_llm": "DeepSeek V4 pro",
   "llms": {
-    "DeepSeek V4": {
+    "DeepSeek V4 pro": {
       "base_url": "http://xxx:8000/v1",
       "model_name": "dsv4",
       "context_max_length": "1m",
@@ -139,6 +170,18 @@ Release 输出：`target/release/holo_proxy.exe`
 }
 ```
 
+字段说明：
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `base_url` | OpenAI 兼容 API 地址 | - |
+| `model_name` | 模型名 | - |
+| `context_max_length` | 最大上下文（支持 `200k`/`1m`） | `200k` |
+| `api_key` | API 密钥 | `none` |
+| `auth_header` | 认证头 | `Authorization` |
+| `auth_prefix` | 认证前缀 | `Bearer ` |
+| `supports_native_function_calling` | 是否支持原生 function calling | `true` |
+| `supports_reasoning_content` | 是否支持推理内容 | `false` |
+
 ## 注意事项
 
 - 参考 proxy-bridge 时仅关注 Claude Code 接口逻辑，忽略 Chrome 扩展等无关功能
@@ -147,3 +190,6 @@ Release 输出：`target/release/holo_proxy.exe`
 - 恢复机制注入的命令必须跨平台兼容（Windows cmd + Linux/Mac bash）
 - 下游 LLM 连接失败时静默重试 3 次（每次新建 Client）
 - 每次重试都用 `fresh_client()` 新建 `reqwest::Client`（`pool_max_idle_per_host=0`）
+- 两条路由发送前统一注入 `chat_template_kwargs` 确保 reasoning 启用
+- Anthropic 路径 reasoning 输出为独立 thinking content_block
+- OpenAI 透传路径 reasoning 包裹 `<thinking>` 标签输出到 content 字段

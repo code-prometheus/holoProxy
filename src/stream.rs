@@ -1,4 +1,4 @@
-use crate::recovery;
+﻿use crate::recovery;
 use crate::types::*;
 use bytes::Bytes;
 use regex::Regex;
@@ -16,6 +16,7 @@ pub struct StreamContext {
     block_idx: u32,
     text_open: bool,
     tool_open: bool,
+    thinking_open: bool,
     has_tool_use: bool,
     pub generated_text: String,
     // XML 拦截相关
@@ -62,6 +63,7 @@ impl StreamContext {
             block_idx: 0,
             text_open: false,
             tool_open: false,
+            thinking_open: false,
             has_tool_use: false,
             generated_text: String::new(),
             text_buffer: String::new(),
@@ -108,6 +110,9 @@ impl StreamContext {
     }
 
     fn ensure_text_open(&mut self) {
+        if self.thinking_open {
+            self.close_thinking();
+        }
         if self.tool_open {
             self.close_tool();
         }
@@ -155,6 +160,9 @@ impl StreamContext {
     }
 
     fn open_tool(&mut self, tool_id: &str, name: &str) {
+        if self.thinking_open {
+            self.close_thinking();
+        }
         if self.text_open {
             self.close_text();
         }
@@ -313,15 +321,50 @@ impl StreamContext {
         }
     }
 
-    /// 处理 reasoning_content
+    /// 处理 reasoning / reasoning_content — 输出为独立 thinking content_block
     pub fn handle_reasoning(&mut self, text: &str) {
-        self.send_text_delta(text);
+        if !self.thinking_open {
+            if self.text_open { self.close_text(); }
+            if self.tool_open { self.close_tool(); }
+            self.send_event(
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": self.block_idx,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                }),
+            );
+            self.thinking_open = true;
+        }
+        self.generated_text.push_str(text);
+        self.send_event(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": self.block_idx,
+                "delta": {"type": "thinking_delta", "thinking": text}
+            }),
+        );
+    }
+
+    fn close_thinking(&mut self) {
+        if self.thinking_open {
+            self.send_event(
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": self.block_idx
+                }),
+            );
+            self.thinking_open = false;
+            self.block_idx += 1;
+        }
     }
 
     /// 结束流：关闭所有开放块 + 自动恢复判断 + 发送 message_delta/message_stop
     pub fn finish(&mut self, upstream_stop_reason: &str) {
-        // 保底：防止空响应
-        if !self.text_open && !self.has_tool_use {
+        // 保底：防止空响应（只考虑 text/tool/thinking）
+        if !self.text_open && !self.thinking_open && !self.has_tool_use {
             self.send_text_delta(" ");
         }
 
@@ -345,6 +388,7 @@ impl StreamContext {
             self.intercept_active = false;
         }
 
+        self.close_thinking();
         self.close_text();
         self.close_tool();
 
@@ -402,6 +446,7 @@ impl StreamContext {
     /// 发送错误消息并完成 SSE 流
     pub fn send_error(&mut self, msg: &str) {
         self.send_text_delta(msg);
+        self.close_thinking();
         self.close_text();
         // Agent 模式下必须注入 fake tool，防止 Claude Code 报 API Error
         if self.is_agent_mode && !self.has_tool_use {

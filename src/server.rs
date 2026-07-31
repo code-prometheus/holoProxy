@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     body::Body,
     extract::Json,
     http::StatusCode,
@@ -57,6 +57,7 @@ pub fn create_router() -> Router {
 
     Router::new()
         .route("/v1/messages", post(handle_messages))
+        .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/models", get(handle_get_models))
         .route("/v1/select_model", post(handle_select_model))
         .with_state(state)
@@ -85,6 +86,13 @@ async fn handle_messages(
     let max_context = parse_context_length(&llm_config.context_max_length);
     if crate::context::should_trim(&openai_req.messages, max_context) {
         crate::context::trim_messages(&mut openai_req.messages, max_context);
+    }
+
+    // 注入 chat_template_kwargs 确保 reasoning 启动
+    let mut req_body = serde_json::to_value(&openai_req).unwrap_or_default();
+    if let Some(obj) = req_body.as_object_mut() {
+        obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": "max"}));
+        obj.insert("stream".into(), serde_json::json!(true));
     }
 
     let req_bytes = openai_req.messages.len() * 512;
@@ -134,13 +142,12 @@ async fn handle_messages(
     let model = llm_config.model_name.clone();
     let mid = msg_id.clone();
     let api = api_url.clone();
-    let oa_req = openai_req;
     let llm_cfg = llm_config;
     let conns = state.active_connections.clone();
 
     tokio::spawn(async move {
         background_request(
-            &api, &oa_req, &llm_cfg, &mid, &model, is_agent_mode, &tools_arc,
+            &api, &req_body, &llm_cfg, &mid, &model, is_agent_mode, &tools_arc,
             timeout_secs, &tx, Some(stop_ka_tx),
         ).await;
         conns.lock().await.remove(&mid);
@@ -162,7 +169,7 @@ async fn handle_messages(
 const MAX_RETRIES: u32 = 3;
 
 async fn background_request(
-    api_url: &str, openai_req: &OpenAIRequest,
+    api_url: &str, openai_req: &serde_json::Value,
     llm_config: &crate::types::LLMConfig,
     msg_id: &str, model_name: &str,
     is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
@@ -277,6 +284,7 @@ async fn forward_sse(
                         has_any_data = true;
                         for choice in &c.choices {
                             if let Some(ref d) = choice.delta {
+                                if let Some(ref r) = d.reasoning { if !r.is_empty() { sse_ctx.handle_reasoning(r); } }
                                 if let Some(ref r) = d.reasoning_content { if !r.is_empty() { sse_ctx.handle_reasoning(r); } }
                                 if let Some(ref ct) = d.content { if !ct.is_empty() { sse_ctx.handle_content(ct); } }
                                 if let Some(ref tcs) = d.tool_calls { for tc in tcs { sse_ctx.handle_tool_call(tc); } }
@@ -292,6 +300,232 @@ async fn forward_sse(
 
     sse_ctx.finish(&finish_reason);
     for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
+    has_any_data
+}
+
+/// 直接透传 OpenAI 格式请求到下游 — 不做协议转换
+async fn handle_chat_completions(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let llm_config = match crate::config::get_active_llm_config() {
+        Some(c) => c,
+        None => {
+            error!("No LLM config");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "No LLM").into_response();
+        }
+    };
+
+    let base_url = llm_config.base_url.trim_end_matches('/');
+    let api_url: Arc<str> = if base_url.ends_with("/chat/completions") {
+        base_url.to_string().into()
+    } else {
+        format!("{}/chat/completions", base_url).into()
+    };
+
+    let msg_id = format!("msg_{}", chrono::Utc::now().timestamp());
+    info!("[req {}] OpenAI passthrough | {}", msg_id, llm_config.model_name);
+
+    {
+        let mut guard = state.active_connections.lock().await;
+        guard.insert(msg_id.clone(), std::time::Instant::now());
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+
+    // keepalive
+    let keepalive_tx = tx.clone();
+    let (stop_ka_tx, mut stop_ka_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = &mut stop_ka_rx => break,
+                _ = interval.tick() => {
+                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mid = msg_id.clone();
+    let api = api_url.clone();
+    let llm_cfg = llm_config;
+    let conns = state.active_connections.clone();
+    let timeout_secs: u64 = 120;
+
+    tokio::spawn(async move {
+        background_request_raw(&api, &body, &llm_cfg, &mid, timeout_secs, &tx, Some(stop_ka_tx)).await;
+        conns.lock().await.remove(&mid);
+    });
+
+    let body_stream = async_stream::stream! {
+        while let Some(data) = rx.recv().await { yield Ok::<_, std::convert::Infallible>(data); }
+    };
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+}
+
+/// 直接透传 SSE — 不解析不转换，原样转发
+async fn background_request_raw(
+    api_url: &str,
+    body: &serde_json::Value,
+    llm_config: &crate::types::LLMConfig,
+    msg_id: &str,
+    timeout_secs: u64,
+    tx: &mpsc::Sender<Bytes>,
+    mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    let mut last_err = String::new();
+    let req_start = std::time::Instant::now();
+
+    for attempt in 1..=MAX_RETRIES {
+        let remaining = MAX_RETRIES - attempt;
+        info!("[{}] attempt={}/{} remaining={} url={}", msg_id, attempt, MAX_RETRIES, remaining, api_url);
+
+        let client = fresh_client();
+        // 注入 chat_template_kwargs 确保 reasoning 启动
+        let mut req_body = body.clone();
+        if let Some(obj) = req_body.as_object_mut() {
+            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": "max"}));
+        obj.insert("stream".into(), serde_json::json!(true));
+        }
+        let mut req = client.post(api_url).json(&req_body)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        if !llm_config.api_key.is_empty() && llm_config.api_key.to_lowercase() != "none" {
+            req = req.header(&llm_config.auth_header,
+                format!("{}{}", llm_config.auth_prefix, llm_config.api_key));
+        }
+
+        let send_future = req.send();
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), send_future).await {
+            Ok(Ok(response)) => {
+                let status = response.status().as_u16();
+                info!("[{}] attempt={} http={} in={:.1}s", msg_id, attempt, status, req_start.elapsed().as_secs_f64());
+                let ka = if attempt == 1 { stop_keepalive.take() } else { None };
+                if forward_raw_sse(response, msg_id, tx, ka).await {
+                    return;
+                }
+                last_err = "empty response".into();
+            }
+            Ok(Err(e)) => {
+                last_err = e.to_string();
+                info!("[{}] attempt={} conn_err={}", msg_id, attempt, last_err);
+            }
+            Err(_) => {
+                last_err = format!("timeout {}s", timeout_secs);
+                info!("[{}] attempt={} timeout={}s", msg_id, attempt, timeout_secs);
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            info!("[{}] retry {}/{} remaining={} err={}", msg_id, attempt, MAX_RETRIES, remaining - 1, last_err);
+        }
+    }
+
+    warn!("[{}] ALL {} retries exhausted after {:.1}s: {}", msg_id, MAX_RETRIES, req_start.elapsed().as_secs_f64(), last_err);
+    // 错误时发送简单 SSE 错误事件
+    let _ = tx.send(Bytes::from(format!("data: [ERROR] downstream unavailable after {} retries: {}\n\n", MAX_RETRIES, last_err))).await;
+}
+
+/// 透传下游 SSE 流 — reasoning 包 <thinking> 标签，其余原样转发
+async fn forward_raw_sse(
+    response: reqwest::Response,
+    msg_id: &str,
+    tx: &mpsc::Sender<Bytes>,
+    mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
+) -> bool {
+    use futures_util::StreamExt;
+    let req_start = std::time::Instant::now();
+    let mut stream = response.bytes_stream();
+    let mut has_any_data = false;
+    let mut first_token = true;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if first_token {
+                    first_token = false;
+                    if let Some(s) = stop_keepalive.take() { let _ = s.send(()); }
+                    info!("[rsp {}] first_token in {:.1}s chunk={}B", msg_id, req_start.elapsed().as_secs_f64(), chunk.len());
+                }
+                has_any_data = true;
+                // 解析 SSE chunk，reasoning 包 <thinking> 标签，其余原样转发
+                let text = String::from_utf8_lossy(&chunk);
+                let mut modified = String::with_capacity(text.len() + 64);
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        // 保留空行（SSE 事件之间的分隔）
+                        modified.push('\n');
+                        continue;
+                    }
+                    if !trimmed.starts_with("data: ") {
+                        modified.push_str(trimmed);
+                        modified.push('\n');
+                        continue;
+                    }
+                    let data_str = trimmed[6..].trim();
+                    if data_str == "[DONE]" {
+                        modified.push_str("data: [DONE]\n\n");
+                        continue;
+                    }
+                    if let Ok(c) = serde_json::from_str::<crate::types::OpenAISseChunk>(data_str) {
+                        let mut has_reasoning = false;
+                        for choice in &c.choices {
+                            if let Some(ref d) = choice.delta {
+                                if let Some(ref r) = d.reasoning { if !r.is_empty() { has_reasoning = true; } }
+                                if let Some(ref r) = d.reasoning_content { if !r.is_empty() { has_reasoning = true; } }
+                            }
+                        }
+                        if has_reasoning {
+                            let mut json_val: serde_json::Value = serde_json::from_str(data_str).unwrap_or_default();
+                            if let Some(choices) = json_val["choices"].as_array_mut() {
+                                for choice in choices {
+                                    if let Some(delta) = choice["delta"].as_object_mut() {
+                                        let mut thinking_text = String::new();
+                                        if let Some(r) = delta.remove("reasoning") {
+                                            if let Some(s) = r.as_str() { thinking_text.push_str(s); }
+                                        }
+                                        if let Some(r) = delta.remove("reasoning_content") {
+                                            if let Some(s) = r.as_str() { thinking_text.push_str(s); }
+                                        }
+                                        if !thinking_text.is_empty() {
+                                            let existing = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                            delta.insert("content".into(), serde_json::json!(format!("{}<thinking>{}</thinking>", existing, thinking_text)));
+                                        }
+                                    }
+                                }
+                            }
+                            modified.push_str("data: ");
+                            modified.push_str(&serde_json::to_string(&json_val).unwrap_or_default());
+                            modified.push_str("\n\n");
+                        } else {
+                            modified.push_str(trimmed);
+                            modified.push('\n');
+                        }
+                    } else {
+                        modified.push_str(trimmed);
+                        modified.push('\n');
+                    }
+                }
+                if tx.send(Bytes::from(modified)).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => { break; }
+        }
+    }
+
     has_any_data
 }
 
