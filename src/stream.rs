@@ -3,7 +3,7 @@ use crate::types::*;
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// SSE 流处理状态机 — 将 OpenAI SSE 流转换为 Anthropic SSE 流
@@ -216,6 +216,9 @@ impl StreamContext {
 
     /// 处理 OpenAI SSE delta content
     pub fn handle_content(&mut self, content: &str) {
+        if !self.text_open && !self.intercept_active {
+            info!("[{}] 📝 content block START", self.msg_id);
+        }
         if self.intercept_active {
             // 拦截模式：收集到 active_close_tag 为止
             self.intercept_buffer.push_str(content);
@@ -324,6 +327,7 @@ impl StreamContext {
     /// 处理 reasoning / reasoning_content — 输出为独立 thinking content_block
     pub fn handle_reasoning(&mut self, text: &str) {
         if !self.thinking_open {
+            info!("[{}] 💭 reasoning block START", self.msg_id);
             if self.text_open { self.close_text(); }
             if self.tool_open { self.close_tool(); }
             self.send_event(
@@ -349,6 +353,7 @@ impl StreamContext {
 
     fn close_thinking(&mut self) {
         if self.thinking_open {
+            info!("[{}] 💭 reasoning block END", self.msg_id);
             self.send_event(
                 "content_block_stop",
                 &serde_json::json!({

@@ -2,7 +2,7 @@
 
 **Claude Code API 代理 — Rust 实现**
 
-将 Claude Code 的 Anthropic Messages API 透明转发到任意 OpenAI 兼容 LLM，同时提供 OpenAI 透传端点。支持流式 SSE、工具调用、reasoning/thinking 处理、自动恢复、Windows 系统托盘。
+将 Claude Code 的 Anthropic Messages API 透明转发到任意 OpenAI 兼容 LLM，同时提供 OpenAI 透传端点。支持流式 SSE、工具调用、reasoning/thinking 处理、智能恢复、Windows 系统托盘。
 
 [![CI](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml)
 
@@ -10,15 +10,16 @@
 
 - **双协议端点**：
   - `POST /v1/messages` — Anthropic Messages API → OpenAI 协议转换
-  - `POST /v1/chat/completions` — OpenAI API 直接透传（reasoning → `<thinking>` 标签）
+  - `POST /v1/chat/completions` — OpenAI API 直接透传（自动替换 model + reasoning → `<thinking>` 标签）
 - **SSE 流处理**：完整状态机，原生 tool_calls + XML 工具调用拦截双通道
 - **reasoning/thinking 支持**：
   - Anthropic 路径：`delta.reasoning` / `delta.reasoning_content` → 独立 thinking content_block
   - OpenAI 透传路径：reasoning → `<thinking></thinking>` 标签 + content 合并
+  - 日志标记 `💭 reasoning` / `📝 content` 区分输出类型
+- **请求增强**：发送到下游前自动注入 `chat_template_kwargs`（`thinking: true, reasoning_effort: "max"`）+ `model` + `stream: true`
 - **Tools Instruction 注入**：不支持原生 function calling 的模型自动注入 XML 格式指令
-- **智能恢复**：硬编码拦截 API 错误/超时 + LLM 语义判断正常结束/异常截断，精准注入 fake tool 防止 Claude Code 报 API Error 退出
-- **请求增强**：发送到下游前自动注入 `chat_template_kwargs`（`thinking: true, reasoning_effort: "max"`）+ `stream: true`
-- **断线重连**：下游连接失败后静默重试 3 次，error 路径无条件注入 fake tool
+- **智能恢复**：硬编码拦截 API 错误/超时 + LLM 语义判断正常结束/异常截断，精准注入 fake tool 防止 Claude Code 报 API Error 退出。v0.2.1 优化判断策略减少误判
+- **断线重连**：下游连接失败后静默重试 3 次（含 HTTP 状态码检查），error 路径无条件注入 fake tool
 - **上下文管理**：超过 80% 阈值自动裁剪，日志记录压缩比
 - **Windows 系统托盘**：右键切换模型
 

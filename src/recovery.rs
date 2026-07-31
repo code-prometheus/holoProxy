@@ -145,11 +145,11 @@ THREE SCENARIOS - READ CAREFULLY:
    KEY SIGNAL: The response was clearly interrupted before completion.
 
 CRITICAL RULES:
-- When in doubt, lean towards "INCOMPLETE" to prevent Claude Code crash (conservative approach)
+- When in doubt, lean towards "COMPLETE" — normal conversation endings are far more common than true cutoffs
 - Error messages from proxy/API are ALWAYS "INCOMPLETE" even if they look grammatically complete
-- Only reply "COMPLETE" when you see clear task completion or natural conversation pause
-- False positive (injecting when not needed) wastes tokens but keeps Claude Code running
-- False negative (not injecting when needed) causes Claude Code to stop → WORSE outcome
+- Reply "COMPLETE" for any natural ending: summary given, question asked, task described as done, file written, etc.
+- Reply "INCOMPLETE" ONLY when the text is clearly mid-sentence, mid-code-block, or an API error message
+- Think step by step: "Is this text clearly interrupted mid-thought?" If not sure → COMPLETE
 
 OUTPUT FORMAT:
 Reply EXACTLY one word: "COMPLETE" or "INCOMPLETE"

@@ -392,13 +392,13 @@ async fn background_request_raw(
         info!("[{}] attempt={}/{} remaining={} url={}", msg_id, attempt, MAX_RETRIES, remaining, api_url);
 
         let client = fresh_client();
-        // 注入 chat_template_kwargs 确保 reasoning 启动
+        // 注入 model + chat_template_kwargs 确保下游识别模型和 reasoning 启用
         let mut req_body = body.clone();
         if let Some(obj) = req_body.as_object_mut() {
+            obj.insert("model".into(), serde_json::json!(llm_config.model_name));
             obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": "max"}));
-        obj.insert("stream".into(), serde_json::json!(true));
-        }
-        let mut req = client.post(api_url).json(&req_body)
+            obj.insert("stream".into(), serde_json::json!(true));
+        }let mut req = client.post(api_url).json(&req_body)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
         if !llm_config.api_key.is_empty() && llm_config.api_key.to_lowercase() != "none" {
@@ -411,9 +411,14 @@ async fn background_request_raw(
             Ok(Ok(response)) => {
                 let status = response.status().as_u16();
                 info!("[{}] attempt={} http={} in={:.1}s", msg_id, attempt, status, req_start.elapsed().as_secs_f64());
-                let ka = if attempt == 1 { stop_keepalive.take() } else { None };
-                if forward_raw_sse(response, msg_id, tx, ka).await {
-                    return;
+                if status < 200 || status >= 300 {
+                    last_err = format!("HTTP {}", status);
+                } else {
+                    let ka = if attempt == 1 { stop_keepalive.take() } else { None };
+                    if forward_raw_sse(response, msg_id, tx, ka).await {
+                        return;
+                    }
+                    last_err = "empty response".into();
                 }
                 last_err = "empty response".into();
             }
