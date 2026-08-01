@@ -201,10 +201,10 @@ mod tests {
     fn test_config() -> LLMConfig {
         LLMConfig {
             base_url: "http://localhost:8000/v1".into(), model_name: "test".into(),
-            context_max_length: "200k".into(), verify_ssl: false, api_key: "none".into(),
+            context_max_length: "200k".into(), api_key: "none".into(),
             auth_header: "Authorization".into(), auth_prefix: "Bearer ".into(),
-            supports_native_function_calling: false, // Test with XML tools instruction (native function calling disabled)
-            supports_reasoning_content: false,
+            supports_native_function_calling: false,
+            thinking: true, reasoning_effort: "max".into(), stream: true,
         }
     }
 

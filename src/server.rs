@@ -91,8 +91,8 @@ async fn handle_messages(
     // 注入 chat_template_kwargs 确保 reasoning 启动
     let mut req_body = serde_json::to_value(&openai_req).unwrap_or_default();
     if let Some(obj) = req_body.as_object_mut() {
-        obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": "max"}));
-        obj.insert("stream".into(), serde_json::json!(true));
+        obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": llm_config.thinking, "reasoning_effort": llm_config.reasoning_effort}));
+        obj.insert("stream".into(), serde_json::json!(llm_config.stream));
     }
 
     let req_bytes = openai_req.messages.len() * 512;
@@ -396,9 +396,10 @@ async fn background_request_raw(
         let mut req_body = body.clone();
         if let Some(obj) = req_body.as_object_mut() {
             obj.insert("model".into(), serde_json::json!(llm_config.model_name));
-            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": "max"}));
-            obj.insert("stream".into(), serde_json::json!(true));
-        }let mut req = client.post(api_url).json(&req_body)
+            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": llm_config.thinking, "reasoning_effort": llm_config.reasoning_effort}));
+            obj.insert("stream".into(), serde_json::json!(llm_config.stream));
+        }
+    let mut req = client.post(api_url).json(&req_body)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
         if !llm_config.api_key.is_empty() && llm_config.api_key.to_lowercase() != "none" {

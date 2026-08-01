@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 use indexmap::IndexMap;
 
 // ==========================================
@@ -189,8 +189,6 @@ pub struct LLMConfig {
     pub model_name: String,
     #[serde(default = "default_context_max_length")]
     pub context_max_length: String,
-    #[serde(default = "default_true")]
-    pub verify_ssl: bool,
     #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_auth_header")]
@@ -200,20 +198,22 @@ pub struct LLMConfig {
     /// 是否支持原生 function calling（不支持则注入 XML Tools Instruction）
     #[serde(default = "default_true")]
     pub supports_native_function_calling: bool,
-    /// 是否支持 reasoning_content（如 DeepSeek R1 的思维链）
-    #[serde(default = "default_false")]
-    pub supports_reasoning_content: bool,
-}
-
-fn default_false() -> bool {
-    false
+    /// 是否启用 thinking/reasoning（注入 chat_template_kwargs.thinking）
+    #[serde(default = "default_true")]
+    pub thinking: bool,
+    /// reasoning 强度: "max" / "medium" / "low"（注入 chat_template_kwargs.reasoning_effort）
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+    /// 是否强制流式输出（注入 stream: true）
+    #[serde(default = "default_true")]
+    pub stream: bool,
 }
 
 pub fn default_context_max_length() -> String {
     "200k".into()
 }
 
-pub fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -223,4 +223,8 @@ pub fn default_auth_header() -> String {
 
 pub fn default_auth_prefix() -> String {
     "Bearer ".into()
+}
+
+pub fn default_reasoning_effort() -> String {
+    "max".into()
 }

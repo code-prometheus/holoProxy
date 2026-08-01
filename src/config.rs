@@ -25,12 +25,13 @@ impl Settings {
                 base_url: "http://127.0.0.1:8000/v1".into(),
                 model_name: "default-model".into(),
                 context_max_length: crate::types::default_context_max_length(),
-                verify_ssl: false,
                 api_key: "none".into(),
                 auth_header: crate::types::default_auth_header(),
                 auth_prefix: crate::types::default_auth_prefix(),
                 supports_native_function_calling: false,
-                supports_reasoning_content: false,
+                thinking: true,
+                reasoning_effort: crate::types::default_reasoning_effort(),
+                stream: true,
             },
         );
         Settings { active_llm: "默认本地大模型".into(), llms }

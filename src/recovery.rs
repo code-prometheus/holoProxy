@@ -174,7 +174,7 @@ No explanation, no punctuation, just the word."#;
 
     // 构建带超时的客户端：增加连接池禁用和更严格的超时设置，防止连接复用导致的问题
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(!config.verify_ssl)
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(8))  // 8 秒总超时，防止 LLM 判断卡住
         .connect_timeout(Duration::from_secs(3))  // 3 秒连接超时
         .pool_max_idle_per_host(0)  // 禁用连接池，每次新建连接
