@@ -490,37 +490,58 @@ pub fn parse_fallback_tool(
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {
     // invoke XML 属性格式: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
-    // 简单字符串解析，不依赖正则
+    // 支持多参数: <invoke name="edit"><parameter name="filePath">...</parameter><parameter name="newString">...</parameter></invoke>
     let lower_text = text.to_lowercase();
     if let Some(invoke_start) = lower_text.find("<invoke") {
-        // 取 name="..." 属性
+        // 取 invoke 的 name="..." 属性
         if let Some(name_start) = text[invoke_start..].find("name=\"") {
             let name_val_start = invoke_start + name_start + 6;
             if let Some(name_end) = text[name_val_start..].find('"') {
                 let t_name = text[name_val_start..name_val_start + name_end].trim().to_string();
-                // 取 <parameter name="...">...</parameter>
-                if let Some(param_start) = text[invoke_start..].find("<parameter") {
-                    let abs_param = invoke_start + param_start;
-                    if let Some(p_name_start) = text[abs_param..].find("name=\"") {
-                        let p_val_start = abs_param + p_name_start + 6;
-                        if let Some(p_name_end) = text[p_val_start..].find('"') {
-                            let p_name = text[p_val_start..p_val_start + p_name_end].trim().to_string();
-                            // 取 >...</parameter>
-                            if let Some(gt_pos) = text[abs_param + p_name_start + 6 + p_name_end..].find('>') {
-                                let content_start = abs_param + p_name_start + 6 + p_name_end + gt_pos + 1;
-                                let p_val = if let Some(close_pos) = text[content_start..].find("</parameter>") {
-                                    text[content_start..content_start + close_pos].trim().to_string()
-                                } else if let Some(close_pos) = text[content_start..].find("</invoke>") {
-                                    text[content_start..content_start + close_pos].trim().to_string()
+                // 查找 invoke 结束标签，限定搜索范围
+                let invoke_end = if let Some(end_pos) = text[invoke_start..].find("</invoke>") {
+                    invoke_start + end_pos
+                } else {
+                    text.len()
+                };
+                let invoke_body = &text[invoke_start..invoke_end];
+
+                // 提取所有 <parameter name="X">V</parameter> 或 <parameter name="X" ...>V</parameter>
+                let mut args_map = serde_json::Map::new();
+                let mut search_from = 0usize;
+                while let Some(p_start) = invoke_body[search_from..].find("<parameter") {
+                    let abs_p = search_from + p_start;
+                    if let Some(p_name_begin) = invoke_body[abs_p..].find("name=\"") {
+                        let p_name_s = abs_p + p_name_begin + 6;
+                        if let Some(p_name_len) = invoke_body[p_name_s..].find('"') {
+                            let p_name = invoke_body[p_name_s..p_name_s + p_name_len].trim().to_string();
+                            // 找到 > 闭合 opening tag
+                            if let Some(gt_pos) = invoke_body[p_name_s + p_name_len..].find('>') {
+                                let content_start = p_name_s + p_name_len + gt_pos + 1;
+                                let p_val = if let Some(close_p) = invoke_body[content_start..].find("</parameter>") {
+                                    invoke_body[content_start..content_start + close_p].trim().to_string()
                                 } else {
-                                    text[content_start..].trim().to_string()
+                                    invoke_body[content_start..].trim().to_string()
                                 };
-                                if !t_name.is_empty() && !p_val.is_empty() {
-                                    return (t_name, serde_json::json!({p_name: p_val}));
+                                let p_val_clean = p_val.trim().to_string();
+                                if !p_name.is_empty() && !p_val_clean.is_empty() {
+                                    args_map.insert(p_name, serde_json::json!(p_val_clean));
                                 }
+                                search_from = content_start + p_val.len();
+                            } else {
+                                search_from = abs_p + 10; // skip broken tag
                             }
+                        } else {
+                            search_from = abs_p + 10;
                         }
+                    } else {
+                        search_from = abs_p + 10;
                     }
+                    if search_from >= invoke_body.len() { break; }
+                }
+
+                if !t_name.is_empty() && !args_map.is_empty() {
+                    return (t_name, serde_json::Value::Object(args_map));
                 }
             }
         }
