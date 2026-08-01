@@ -46,6 +46,9 @@ impl StreamContext {
         valid_triggers.insert("<｜tool_call｜>".into(), "</｜tool_call｜>".into());
         valid_triggers.insert("<ツtool_callsツ>".into(), "</ツtool_callsツ>".into());
         valid_triggers.insert("<ツtool_callツ>".into(), "</ツtool_callツ>".into());
+        // invoke/parameter XML 格式
+        valid_triggers.insert("<invoke".into(), "</invoke>".into());
+        valid_triggers.insert("<parameter".into(), "</parameter>".into());
 
         // 为每个有效工具名添加触发标签
         for name in valid_tools.keys() {
@@ -486,6 +489,43 @@ pub fn parse_fallback_tool(
     text: &str,
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {
+    // invoke XML 属性格式: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
+    // 简单字符串解析，不依赖正则
+    let lower_text = text.to_lowercase();
+    if let Some(invoke_start) = lower_text.find("<invoke") {
+        // 取 name="..." 属性
+        if let Some(name_start) = text[invoke_start..].find("name=\"") {
+            let name_val_start = invoke_start + name_start + 6;
+            if let Some(name_end) = text[name_val_start..].find('"') {
+                let t_name = text[name_val_start..name_val_start + name_end].trim().to_string();
+                // 取 <parameter name="...">...</parameter>
+                if let Some(param_start) = text[invoke_start..].find("<parameter") {
+                    let abs_param = invoke_start + param_start;
+                    if let Some(p_name_start) = text[abs_param..].find("name=\"") {
+                        let p_val_start = abs_param + p_name_start + 6;
+                        if let Some(p_name_end) = text[p_val_start..].find('"') {
+                            let p_name = text[p_val_start..p_val_start + p_name_end].trim().to_string();
+                            // 取 >...</parameter>
+                            if let Some(gt_pos) = text[abs_param + p_name_start + 6 + p_name_end..].find('>') {
+                                let content_start = abs_param + p_name_start + 6 + p_name_end + gt_pos + 1;
+                                let p_val = if let Some(close_pos) = text[content_start..].find("</parameter>") {
+                                    text[content_start..content_start + close_pos].trim().to_string()
+                                } else if let Some(close_pos) = text[content_start..].find("</invoke>") {
+                                    text[content_start..content_start + close_pos].trim().to_string()
+                                } else {
+                                    text[content_start..].trim().to_string()
+                                };
+                                if !t_name.is_empty() && !p_val.is_empty() {
+                                    return (t_name, serde_json::json!({p_name: p_val}));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // DSML 格式: <tool_name>Name</tool_name><tool_arguments>{"arg":"val"}</tool_arguments>
     let ds_name = Regex::new(r"(?i)<[｜|]?(?:DSML[｜|]?)?tool_name[｜|]?>\s*(.*?)\s*(?:</|[｜|]|$)")
         .ok();

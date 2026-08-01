@@ -460,15 +460,19 @@ async fn forward_raw_sse(
     let mut intercept_active = false;
     let mut intercept_buffer = String::new();
     let mut active_close_tag = String::new();
-    // 触发标签集合（与 stream.rs 保持一致）
+    // 触发标签集合（与 stream.rs 保持一致，fullwidth pipe ｜ U+FF5C）
     let mut triggers: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     triggers.insert("<tool_call>", "</tool_call>");
     triggers.insert("```json", "```");
     triggers.insert("```tool_call", "```");
-    triggers.insert("<DSML|tool_name>", "</DSML|tool_name>");
-    triggers.insert("<DSML|tool_calls>", "</DSML|tool_calls>");
-    triggers.insert("<|tool_calls|>", "</|tool_calls|>");
-    triggers.insert("<|tool_call|>", "</|tool_call|>");
+    // fullwidth pipe variants
+    triggers.insert("<｜tool_calls｜>", "</｜tool_calls｜>");
+    triggers.insert("<｜tool_call｜>", "</｜tool_call｜>");
+    triggers.insert("<｜invoke｜>", "</｜invoke｜>");
+    triggers.insert("<｜parameter｜>", "</｜parameter｜>");
+    triggers.insert("<DSML｜tool_name｜>", "</DSML｜tool_name｜>");
+    triggers.insert("<DSML｜tool_calls｜>", "</DSML｜tool_calls｜>");
+    // katakana variants
     triggers.insert("<ツtool_callsツ>", "</ツtool_callsツ>");
     triggers.insert("<ツtool_callツ>", "</ツtool_callツ>");
 
