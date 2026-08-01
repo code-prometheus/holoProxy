@@ -266,18 +266,25 @@ async fn forward_sse(
     let mut finish_reason = String::from("stop");
     let mut has_any_data = false;
     let mut first_token = true;
+    let mut line_buf_sse = String::new(); // 跨 chunk 行缓冲
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
                 if first_token {
                     first_token = false;
-                    // 首 token 到达，停止 keepalive
                     if let Some(s) = stop_keepalive.take() { let _ = s.send(()); }
                     info!("[rsp {}] {} first_token in {:.1}s chunk={}B", msg_id, model_name, req_start.elapsed().as_secs_f64(), chunk.len());
                 }
-                let text = String::from_utf8_lossy(&chunk);
-                for line in text.lines() {
+                // 行缓冲：处理完整行，保留不完整尾部
+                line_buf_sse.push_str(&String::from_utf8_lossy(&chunk));
+                let complete_end = line_buf_sse.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let complete_text = line_buf_sse[..complete_end].to_string();
+                let tail = line_buf_sse[complete_end..].to_string();
+                line_buf_sse.clear();
+                line_buf_sse.push_str(&tail);
+
+                for line in complete_text.lines() {
                     let line = line.trim();
                     if line.is_empty() || !line.starts_with("data: ") { continue; }
                     let data_str = &line[6..];
