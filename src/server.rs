@@ -458,7 +458,7 @@ async fn forward_raw_sse(
     let mut has_any_data = false;
     let mut first_token = true;
     let mut reasoning_open = false;
-    // 工具调用拦截缓冲区（复用 Anthropic 路径相同的逻辑）
+    let mut line_buf = String::new(); // 跨 chunk 行缓冲
     let mut content_buf = String::new();
     let mut intercept_active = false;
     let mut intercept_buffer = String::new();
@@ -488,9 +488,21 @@ async fn forward_raw_sse(
                     info!("[rsp {}] first_token in {:.1}s chunk={}B", msg_id, req_start.elapsed().as_secs_f64(), chunk.len());
                 }
                 has_any_data = true;
-                let text = String::from_utf8_lossy(&chunk);
-                let mut modified = String::with_capacity(text.len() + 128);
-                for line in text.lines() {
+                // 追加到行缓冲区，处理完整行，保留不完整的尾部
+                line_buf.push_str(&String::from_utf8_lossy(&chunk));
+                let mut modified = String::with_capacity(line_buf.len() + 128);
+                // 找出最后一个换行之后的内容（可能不完整）
+                let complete_end = if let Some(last_nl) = line_buf.rfind('\n') {
+                    last_nl + 1
+                } else {
+                    0
+                };
+                let complete_text = line_buf[..complete_end].to_string();
+                let incomplete_tail = line_buf[complete_end..].to_string();
+                line_buf.clear();
+                line_buf.push_str(&incomplete_tail);
+
+                for line in complete_text.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         modified.push('\n');
