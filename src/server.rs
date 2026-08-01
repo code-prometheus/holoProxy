@@ -478,6 +478,8 @@ async fn forward_raw_sse(
     // fullwidth pipe variants
     triggers.insert("<｜tool_calls｜>", "</｜tool_calls｜>");
     triggers.insert("<｜tool_call｜>", "</｜tool_call｜>");
+    triggers.insert("<invoke", "</invoke>");
+    triggers.insert("<parameter", "</parameter>");
     triggers.insert("<｜invoke｜>", "</｜invoke｜>");
     triggers.insert("<｜parameter｜>", "</｜parameter｜>");
     triggers.insert("<DSML｜tool_name｜>", "</DSML｜tool_name｜>");

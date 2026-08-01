@@ -48,7 +48,7 @@ impl StreamContext {
         valid_triggers.insert("<ツtool_callツ>".into(), "</ツtool_callツ>".into());
         // invoke/parameter XML 格式
         valid_triggers.insert("<invoke".into(), "</invoke>".into());
-        valid_triggers.insert("<parameter".into(), "</parameter>".into());
+        
 
         // 为每个有效工具名添加触发标签
         for name in valid_tools.keys() {
