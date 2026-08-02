@@ -48,6 +48,7 @@ impl StreamContext {
         valid_triggers.insert("<ツtool_callツ>".into(), "</ツtool_callツ>".into());
         // invoke/parameter XML 格式
         valid_triggers.insert("<invoke".into(), "</invoke>".into());
+    valid_triggers.insert("<｜invoke｜".into(), "</｜invoke｜>".into());
         
 
         // 为每个有效工具名添加触发标签
@@ -492,7 +493,7 @@ pub fn parse_fallback_tool(
     // invoke XML 属性格式: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
     // 支持多参数: <invoke name="edit"><parameter name="filePath">...</parameter><parameter name="newString">...</parameter></invoke>
     let lower_text = text.to_lowercase();
-    if let Some(invoke_start) = lower_text.find("<invoke") {
+    if let Some(invoke_start) = lower_text.find("<invoke").or_else(|| text.find("<｜invoke｜")) {
         // 取 invoke 的 name="..." 属性
         if let Some(name_start) = text[invoke_start..].find("name=\"") {
             let name_val_start = invoke_start + name_start + 6;
@@ -500,6 +501,8 @@ pub fn parse_fallback_tool(
                 let t_name = text[name_val_start..name_val_start + name_end].trim().to_string();
                 // 查找 invoke 结束标签，限定搜索范围
                 let invoke_end = if let Some(end_pos) = text[invoke_start..].find("</invoke>") {
+                    invoke_start + end_pos
+                } else if let Some(end_pos) = text[invoke_start..].find("</｜invoke｜>") {
                     invoke_start + end_pos
                 } else {
                     text.len()
@@ -509,7 +512,7 @@ pub fn parse_fallback_tool(
                 // 提取所有 <parameter name="X">V</parameter> 或 <parameter name="X" ...>V</parameter>
                 let mut args_map = serde_json::Map::new();
                 let mut search_from = 0usize;
-                while let Some(p_start) = invoke_body[search_from..].find("<parameter") {
+                while let Some(p_start) = invoke_body[search_from..].to_lowercase().find("<parameter") {
                     let abs_p = search_from + p_start;
                     if let Some(p_name_begin) = invoke_body[abs_p..].find("name=\"") {
                         let p_name_s = abs_p + p_name_begin + 6;
@@ -518,7 +521,7 @@ pub fn parse_fallback_tool(
                             // 找到 > 闭合 opening tag
                             if let Some(gt_pos) = invoke_body[p_name_s + p_name_len..].find('>') {
                                 let content_start = p_name_s + p_name_len + gt_pos + 1;
-                                let p_val = if let Some(close_p) = invoke_body[content_start..].find("</parameter>") {
+                                let p_val = if let Some(close_p) = invoke_body[content_start..].to_lowercase().find("</parameter>") {
                                     invoke_body[content_start..content_start + close_p].trim().to_string()
                                 } else {
                                     invoke_body[content_start..].trim().to_string()
