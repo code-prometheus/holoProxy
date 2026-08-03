@@ -499,12 +499,21 @@ async fn forward_raw_sse(
     triggers.insert("<｜tool_call｜>", "</｜tool_call｜>");
 
     triggers.insert("<｜invoke｜>", "</｜invoke｜>");
-    triggers.insert("<｜parameter｜>", "</｜parameter｜>");
     triggers.insert("<DSML｜tool_name｜>", "</DSML｜tool_name｜>");
     triggers.insert("<DSML｜tool_calls｜>", "</DSML｜tool_calls｜>");
     // katakana variants
     triggers.insert("<ツtool_callsツ>", "</ツtool_callsツ>");
     triggers.insert("<ツtool_callツ>", "</ツtool_callツ>");
+    // invoke ASCII variant
+    triggers.insert("<invoke", "</invoke>");
+    // DSML individual tool_call
+    // DSML ▁(U+2581) variants — model actual output format
+    // DSML begin variants
+    triggers.insert("<｜tool_calls_begin｜>", "<｜tool_call_end｜>");
+    triggers.insert("<｜tool_call_begin｜>", "<｜tool_call_end｜>");
+    // DSML wrapper end tags (self-closing)
+    triggers.insert("<｜tool_calls_end｜>", "<｜tool_calls_end｜>");
+    triggers.insert("<｜tool_call_end｜>", "<｜tool_call_end｜>");
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -548,6 +557,32 @@ async fn forward_raw_sse(
                             modified.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
                             modified.push_str(&buf_json);
                             modified.push_str("}}]}\n\n");
+        // 处理未闭合的拦截缓冲（防止 DSML 跨 chunk 未完成）
+        if intercept_active && !intercept_buffer.is_empty() {
+            let (tool_name, tool_args) = stream::parse_fallback_tool(
+                &intercept_buffer,
+                &std::collections::HashMap::new(),
+            );
+            if tool_name != "unknown" {
+                let tool_id = stream::gen_tool_id();
+                let tc_json = serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": serde_json::to_string(&tool_args).unwrap_or_default()}
+                    }]}}]
+                });
+                modified.push_str("data: ");
+                modified.push_str(&serde_json::to_string(&tc_json).unwrap_or_default());
+                modified.push_str("
+
+");
+                info!("[rsp {}] 🔧 finalize XML/DSML on DONE: {}", msg_id, tool_name);
+            }
+            intercept_active = false;
+            intercept_buffer.clear();
+        }
                             content_buf.clear();
                         }
                         if reasoning_open {
