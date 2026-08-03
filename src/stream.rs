@@ -48,8 +48,17 @@ impl StreamContext {
         valid_triggers.insert("<ツtool_callツ>".into(), "</ツtool_callツ>".into());
         // invoke/parameter XML 格式
         valid_triggers.insert("<invoke".into(), "</invoke>".into());
-    valid_triggers.insert("<｜invoke｜".into(), "</｜invoke｜>".into());
-        
+        valid_triggers.insert("<｜invoke｜".into(), "</｜invoke｜>".into());
+
+        // DeepSeek DSML 格式 ▁(U+2581) 变体 — 模型实际输出格式
+        valid_triggers.insert("<｜tool▁calls▁begin｜>".into(), "<｜tool▁call▁end｜>".into());
+        valid_triggers.insert("<｜tool▁call▁begin｜>".into(), "<｜tool▁call▁end｜>".into());
+        // _(U+005F) 变体 — 部分上游可能做归一化
+        valid_triggers.insert("<｜tool_calls_begin｜>".into(), "<｜tool_call_end｜>".into());
+        valid_triggers.insert("<｜tool_call_begin｜>".into(), "<｜tool_call_end｜>".into());
+        // DSML 包装闭合标签 — 注册为自闭合触发，解析返回 unknown 自动跳过
+        valid_triggers.insert("<｜tool▁calls▁end｜>".into(), "<｜tool▁calls▁end｜>".into());
+        valid_triggers.insert("<｜tool_calls_end｜>".into(), "<｜tool_calls_end｜>".into());
 
         // 为每个有效工具名添加触发标签
         for name in valid_tools.keys() {
@@ -113,6 +122,58 @@ impl StreamContext {
         std::mem::take(&mut self.output)
     }
 
+    /// 刷新 text_buffer 中的缓冲文本（仅在非拦截模式下执行）
+    fn flush_text_buffer(&mut self) {
+        if !self.text_buffer.is_empty() && !self.intercept_active {
+            let remaining = std::mem::take(&mut self.text_buffer);
+            self.send_text_delta(&remaining);
+        }
+    }
+
+    /// 在阶段切换（tool_call/reasoning）前处理未完成的拦截缓冲
+    fn finalize_intercept(&mut self) {
+        while self.intercept_active {
+            let buffer = std::mem::take(&mut self.intercept_buffer);
+
+            // 尝试找到闭合标签；找不到则处理整个缓冲
+            let (full_xml, remaining) = if let Some(close_pos) =
+                buffer.find(&self.active_close_tag)
+            {
+                let end = close_pos + self.active_close_tag.len();
+                (buffer[..end].to_string(), buffer[end..].to_string())
+            } else {
+                (buffer, String::new())
+            };
+
+            let (tool_name, tool_args) = parse_fallback_tool(&full_xml, &self.valid_tools);
+            if tool_name != "unknown" && self.valid_tools.contains_key(&tool_name) {
+                let tool_id = gen_tool_id();
+                self.open_tool(&tool_id, &tool_name);
+                let args_str =
+                    serde_json::to_string(&tool_args).unwrap_or_else(|_| "{}".into());
+                self.send_tool_delta(&args_str);
+                self.close_tool();
+            } else {
+                warn!(
+                    "⚠️ [XML Parse] finalize_intercept 拦截到无效工具标签，跳过: {}",
+                    &full_xml[..full_xml.len().min(100)]
+                );
+            }
+
+            self.intercept_active = false;
+
+            if !remaining.is_empty() {
+                self.text_buffer = remaining;
+                self.check_text_buffer_triggers();
+                // 如果 check_text_buffer_triggers 发现了新触发标签，
+                // intercept_active 会再次变为 true，循环继续
+            } else {
+                self.text_buffer.clear();
+                break;
+            }
+        }
+    }
+
     fn ensure_text_open(&mut self) {
         if self.thinking_open {
             self.close_thinking();
@@ -164,6 +225,9 @@ impl StreamContext {
     }
 
     fn open_tool(&mut self, tool_id: &str, name: &str) {
+        // 刷新缓冲文本，防止内容丢失
+        self.flush_text_buffer();
+
         if self.thinking_open {
             self.close_thinking();
         }
@@ -287,6 +351,11 @@ impl StreamContext {
         if let (Some(idx), Some(open_tag)) = (earliest_idx, matched_open_tag) {
             let close_tag = self.valid_triggers.get(open_tag).cloned().unwrap_or_default();
 
+            // 空闭合标签守卫：防止 contains("") 恒为 true
+            if close_tag.is_empty() {
+                return;
+            }
+
             // 发送 open_tag 之前的文本
             if idx > 0 {
                 let pre_text = self.text_buffer[..idx].to_string();
@@ -297,10 +366,9 @@ impl StreamContext {
             self.active_close_tag = close_tag;
             self.intercept_buffer = self.text_buffer[idx..].to_string();
             self.text_buffer.clear();
-        } else if self.text_buffer.len() > 35 {
-            // 缓冲够大且没有触发标签 → 发送文本（保留尾部 35 字符防止截断）
-            // 用 floor_char_boundary 确保不在多字节字符中间切分
-            let safe_cut = self.text_buffer.len() - 35;
+        } else if self.text_buffer.len() > 50 {
+            // 缓冲够大且没有触发标签 → 发送文本（保留尾部 50 字节防止截断多字节 DSML 标签）
+            let safe_cut = self.text_buffer.len() - 50;
             let send_len = self.text_buffer.floor_char_boundary(safe_cut);
             let send_text = self.text_buffer[..send_len].to_string();
             self.send_text_delta(&send_text);
@@ -310,6 +378,11 @@ impl StreamContext {
 
     /// 处理原生 tool_calls delta
     pub fn handle_tool_call(&mut self, tc: &OpenAIToolCallDelta) {
+        // 阶段切换：先处理未完成的拦截缓冲
+        self.finalize_intercept();
+        // 刷新文本缓冲，防止内容丢失
+        self.flush_text_buffer();
+
         let idx = tc.index.unwrap_or(0);
         if !self.active_native_tools.contains_key(&idx) {
             let name = tc
@@ -331,6 +404,11 @@ impl StreamContext {
     /// 处理 reasoning / reasoning_content — 输出为独立 thinking content_block
     pub fn handle_reasoning(&mut self, text: &str) {
         if !self.thinking_open {
+            // 阶段切换：先处理未完成的拦截缓冲
+            self.finalize_intercept();
+            // 刷新文本缓冲，防止内容丢失
+            self.flush_text_buffer();
+
             info!("[{}] 💭 reasoning block START", self.msg_id);
             if self.text_open { self.close_text(); }
             if self.tool_open { self.close_tool(); }
@@ -378,24 +456,12 @@ impl StreamContext {
         }
 
         // 刷新 text_buffer 中剩余的内容
-        if !self.text_buffer.is_empty() && !self.intercept_active {
-            let remaining = std::mem::take(&mut self.text_buffer);
-            self.send_text_delta(&remaining);
-        }
+        self.flush_text_buffer();
 
-        // 如果拦截模式未关闭
-        if self.intercept_active {
-            let remaining = std::mem::take(&mut self.intercept_buffer);
-            let (tool_name, tool_args) = parse_fallback_tool(&remaining, &self.valid_tools);
-            if tool_name != "unknown" && self.valid_tools.contains_key(&tool_name) {
-                let tool_id = gen_tool_id();
-                self.open_tool(&tool_id, &tool_name);
-                let args_str = serde_json::to_string(&tool_args).unwrap_or_else(|_| "{}".into());
-                self.send_tool_delta(&args_str);
-                self.close_tool();
-            }
-            self.intercept_active = false;
-        }
+        // 如果拦截模式未关闭，处理剩余拦截缓冲
+        self.finalize_intercept();
+        // finalize_intercept 可能留下少量文本在 text_buffer 中
+        self.flush_text_buffer();
 
         self.close_thinking();
         self.close_text();
@@ -454,6 +520,7 @@ impl StreamContext {
 
     /// 发送错误消息并完成 SSE 流
     pub fn send_error(&mut self, msg: &str) {
+        self.flush_text_buffer();
         self.send_text_delta(msg);
         self.close_thinking();
         self.close_text();
@@ -490,6 +557,64 @@ pub fn parse_fallback_tool(
     text: &str,
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {
+    // 归一化：将 DeepSeek 的 ▁(U+2581) 统一为 _(U+005F)，后续解析全部使用 _ 变体
+    let normalized = text.replace('▁', "_");
+    let text = normalized.as_str();
+
+    // DeepSeek DSML 格式:
+    // <｜tool_call_begin｜>function<｜tool_sep｜>name<｜tool_call_argument_begin｜>{json}<｜tool_call_end｜>
+    const DSML_SEP: &str = "<｜tool_sep｜>";
+    const DSML_ARG_BEGIN: &str = "<｜tool_call_argument_begin｜>";
+    const DSML_CALL_END: &str = "<｜tool_call_end｜>";
+    if let Some(sep_pos) = text.find(DSML_SEP) {
+        let after_sep = &text[sep_pos + DSML_SEP.len()..];
+        if let Some(arg_pos) = after_sep.find(DSML_ARG_BEGIN) {
+            let name = after_sep[..arg_pos].trim().to_string();
+            let args_start = arg_pos + DSML_ARG_BEGIN.len();
+            let after_args = &after_sep[args_start..];
+            let args_end = after_args.find(DSML_CALL_END).unwrap_or(after_args.len());
+            let args_str = after_args[..args_end].trim();
+            if !name.is_empty() {
+                // 大小写不敏感匹配工具名，返回精确 key
+                let matched_name = valid_tools
+                    .keys()
+                    .find(|k| k.eq_ignore_ascii_case(&name))
+                    .cloned()
+                    .unwrap_or(name);
+                // 优先尝试直接解析 JSON
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+                    return (matched_name, args);
+                }
+                // 兜底：提取平衡括号内的 JSON（处理 markdown 包裹等情况）
+                if let Some(start) = args_str.find('{') {
+                    let mut depth = 0i32;
+                    let mut end = start;
+                    for (i, c) in args_str[start..].char_indices() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = start + i + 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if end > start {
+                        if let Ok(args) =
+                            serde_json::from_str::<serde_json::Value>(&args_str[start..end])
+                        {
+                            return (matched_name, args);
+                        }
+                    }
+                }
+                return (matched_name, serde_json::json!({}));
+            }
+        }
+    }
+
     // invoke XML 属性格式: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
     // 支持多参数: <invoke name="edit"><parameter name="filePath">...</parameter><parameter name="newString">...</parameter></invoke>
     let lower_text = text.to_lowercase();
@@ -551,10 +676,10 @@ pub fn parse_fallback_tool(
     }
 
     // DSML 格式: <tool_name>Name</tool_name><tool_arguments>{"arg":"val"}</tool_arguments>
-    let ds_name = Regex::new(r"(?i)<[｜|]?(?:DSML[｜|]?)?tool_name[｜|]?>\s*(.*?)\s*(?:</|[｜|]|$)")
+    let ds_name = Regex::new(r"(?i)<[｜|]?(?:DSML[｜|]?)?tool_name[｜|]?>\s*([\s\S]*?)\s*(?:</[｜|]|$)")
         .ok();
     let ds_args = Regex::new(
-        r"(?i)<[｜|]?(?:DSML[｜|]?)?(?:tool_arguments|parameter)[｜|]?>\s*(.*?)\s*(?:</[｜|]|$)",
+        r"(?i)<[｜|]?(?:DSML[｜|]?)?(?:tool_arguments|parameter)[｜|]?>\s*([\s\S]*?)\s*(?:</[｜|]|$)",
     )
     .ok();
 
@@ -662,6 +787,43 @@ mod tests {
         let (name, _args) = parse_fallback_tool(input, &valid_tools);
         // JSON block inside XML should match
         assert_eq!(name, "Bash");
+    }
+
+    #[test]
+    fn test_parse_fallback_tool_dsml() {
+        let valid_tools = std::collections::HashMap::from([(
+            "Bash".into(),
+            ToolDef {
+                name: "Bash".into(),
+                description: Some("Run commands".into()),
+                input_schema: Some(serde_json::json!({
+                    "properties": {"command": {"type": "string"}}
+                })),
+            },
+        )]);
+        // 使用 ▁(U+2581) 变体 — 模型实际输出格式
+        let input = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>Bash<｜tool▁call▁argument▁begin｜>{\"command\":\"ls -la\"}<｜tool▁call▁end｜>";
+        let (name, args) = parse_fallback_tool(input, &valid_tools);
+        assert_eq!(name, "Bash");
+        assert_eq!(args.get("command").unwrap().as_str().unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn test_parse_fallback_tool_dsml_case_insensitive() {
+        let valid_tools = std::collections::HashMap::from([(
+            "Bash".into(),
+            ToolDef {
+                name: "Bash".into(),
+                description: Some("Run commands".into()),
+                input_schema: Some(serde_json::json!({
+                    "properties": {"command": {"type": "string"}}
+                })),
+            },
+        )]);
+        // 工具名小写
+        let input = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>bash<｜tool▁call▁argument▁begin｜>{\"command\":\"ls\"}<｜tool▁call▁end｜>";
+        let (name, _args) = parse_fallback_tool(input, &valid_tools);
+        assert_eq!(name, "Bash"); // 应返回 valid_tools 中的精确 key
     }
 
     #[test]

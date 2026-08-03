@@ -92,7 +92,7 @@ async fn handle_messages(
     let mut req_body = serde_json::to_value(&openai_req).unwrap_or_default();
     if let Some(obj) = req_body.as_object_mut() {
         if llm_config.thinking {
-            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": llm_config.reasoning_effort.as_str()}));
+            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": llm_config.thinking, "reasoning_effort": llm_config.reasoning_effort.as_str()}));
         }
         obj.insert("stream".into(), serde_json::json!(llm_config.stream));
     }
@@ -405,7 +405,7 @@ async fn background_request_raw(
         let mut req_body = body.clone();
         if let Some(obj) = req_body.as_object_mut() {
             obj.insert("model".into(), serde_json::json!(llm_config.model_name));
-            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": true, "reasoning_effort": llm_config.reasoning_effort.as_str()}));
+            obj.insert("chat_template_kwargs".into(), serde_json::json!({"thinking": llm_config.thinking, "reasoning_effort": llm_config.reasoning_effort.as_str()}));
             obj.insert("stream".into(), serde_json::json!(llm_config.stream));
         }
     let mut req = client.post(api_url).json(&req_body)
@@ -430,7 +430,6 @@ async fn background_request_raw(
                     }
                     last_err = "empty response".into();
                 }
-                last_err = "empty response".into();
             }
             Ok(Err(e)) => {
                 last_err = e.to_string();
@@ -449,7 +448,27 @@ async fn background_request_raw(
 
     warn!("[{}] ALL {} retries exhausted after {:.1}s: {}", msg_id, MAX_RETRIES, req_start.elapsed().as_secs_f64(), last_err);
     // 错误时发送简单 SSE 错误事件
-    let _ = tx.send(Bytes::from(format!("data: [ERROR] downstream unavailable after {} retries: {}\n\n", MAX_RETRIES, last_err))).await;
+    // OpenAI path recovery: inject fake tool_call to keep opencode running
+    let recovery_args = serde_json::json!({"command": "echo holoProxy recovery && pwd"});
+    let recovery_id = crate::stream::gen_tool_id();
+    let recovery_sse = format!(
+        "data: {}
+
+",
+        serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": recovery_id,
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "arguments": serde_json::to_string(&recovery_args).unwrap_or_default()
+                }
+            }]}}]
+        }).to_string()
+    );
+    let _ = tx.send(Bytes::from(recovery_sse)).await;
+    info!("[{}] OpenAI recovery injected", msg_id);
 }
 
 /// 透传下游 SSE 流 — reasoning 包 <thinking> 标签，其余原样转发

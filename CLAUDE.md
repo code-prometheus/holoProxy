@@ -131,10 +131,12 @@ holoProxy (127.0.0.1:5430)
 #### 5. HTTP 代理模块 (`server.rs`)
 - 监听 `127.0.0.1:5430`
 - 路由：`POST /v1/messages`、`POST /v1/chat/completions`、`GET /v1/models`、`POST /v1/select_model`
-- **请求注入**：两条路由发送前统一注入 `chat_template_kwargs`（`thinking: true, reasoning_effort: "max"`）和 `stream: true`
+- **请求注入**：两条路由发送前统一注入 `chat_template_kwargs`（仅 `thinking=true` 时注入，`thinking` 和 `reasoning_effort` 由配置驱动）和 `stream: true`
 - 重连机制：每次重试新建 `reqwest::Client`（`pool_max_idle_per_host=0`）
 - 日志格式 `[msg_id] attempt=N/3 remaining=M url=... http=STATUS in=X.Xs`
-- **OpenAI 透传**：`forward_raw_sse` 解析 SSE chunk，reasoning 字段 → `<thinking>` 标签包裹后合并到 content
+- **Anthropic 路径**：`forward_sse` 完整 SSE 状态机转换（协议转译 + reasoning + 工具调用拦截 + 恢复注入）
+- **OpenAI 透传**：`forward_raw_sse` 解析 SSE chunk，reasoning 字段 → `<thinking>` 标签包裹后合并到 content；支持 DSML/XML 工具调用拦截
+- **OpenAI 路径 Recovery**：`background_request_raw` 重试耗尽后注入 fake tool_call（Bash + echo），防止 opencode 等客户端因未识别工具调用而停止
 
 #### 6. Windows 托盘模块 (`tray.rs`)
 - 系统托盘图标 + 右键菜单列出所有 LLM（激活标记 ✓）
