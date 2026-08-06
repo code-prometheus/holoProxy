@@ -11,6 +11,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
 use crate::config::{get_active_llm_name, get_llm_names};
@@ -121,7 +122,7 @@ async fn handle_messages(
         guard.insert(msg_id.clone(), std::time::Instant::now());
     }
 
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
 
     // 首 token 到达前每 15s 发 keepalive，首 token 后立即停止
     let keepalive_tx = tx.clone();
@@ -132,7 +133,7 @@ async fn handle_messages(
             tokio::select! {
                 _ = &mut stop_ka_rx => break,
                 _ = interval.tick() => {
-                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
+                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).is_err() {
                         break;
                     }
                 }
@@ -175,7 +176,7 @@ async fn background_request(
     llm_config: &crate::types::LLMConfig,
     msg_id: &str, model_name: &str,
     is_agent_mode: bool, valid_tools: &Arc<HashMap<String, ToolDef>>,
-    timeout_secs: u64, tx: &mpsc::Sender<Bytes>,
+    timeout_secs: u64, tx: &UnboundedSender<Bytes>,
     mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut last_err = String::new();
@@ -236,17 +237,16 @@ async fn send_error_response(
     msg_id: &str, model_name: &str,
     is_agent_mode: bool,
     valid_tools: &Arc<HashMap<String, ToolDef>>,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &UnboundedSender<Bytes>,
     last_err: &str,
 ) {
     let mut sse_ctx = StreamContext::new(
-        msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(),
+        msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(), tx.clone(),
     );
     sse_ctx.send_error(&format!(
         "[holoProxy Error] 下游 LLM 连接失败 (已重试{}次): {}",
         MAX_RETRIES, last_err
-    ));
-    for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
+    )).await;
 }
 
 async fn forward_sse(
@@ -254,14 +254,14 @@ async fn forward_sse(
     msg_id: &str, model_name: &str,
     is_agent_mode: bool,
     valid_tools: &Arc<HashMap<String, ToolDef>>,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &UnboundedSender<Bytes>,
     mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     use futures_util::StreamExt;
     let req_start = std::time::Instant::now();
     let mut stream = response.bytes_stream();
     let mut sse_ctx = StreamContext::new(
-        msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(),
+        msg_id.into(), model_name.into(), is_agent_mode, (**valid_tools).clone(), tx.clone(),
     );
     let mut finish_reason = String::from("stop");
     let mut has_any_data = false;
@@ -307,8 +307,7 @@ async fn forward_sse(
         }
     }
 
-    sse_ctx.finish(&finish_reason);
-    for batch in sse_ctx.take_output() { let _ = tx.send(batch).await; }
+    sse_ctx.finish(&finish_reason).await;
     has_any_data
 }
 
@@ -340,7 +339,7 @@ async fn handle_chat_completions(
         guard.insert(msg_id.clone(), std::time::Instant::now());
     }
 
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
 
     // keepalive
     let keepalive_tx = tx.clone();
@@ -351,7 +350,7 @@ async fn handle_chat_completions(
             tokio::select! {
                 _ = &mut stop_ka_rx => break,
                 _ = interval.tick() => {
-                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).await.is_err() {
+                    if keepalive_tx.send(Bytes::from(": keepalive\n\n")).is_err() {
                         break;
                     }
                 }
@@ -390,7 +389,7 @@ async fn background_request_raw(
     llm_config: &crate::types::LLMConfig,
     msg_id: &str,
     timeout_secs: u64,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &UnboundedSender<Bytes>,
     mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut last_err = String::new();
@@ -467,7 +466,7 @@ async fn background_request_raw(
             }]}}]
         }).to_string()
     );
-    let _ = tx.send(Bytes::from(recovery_sse)).await;
+    let _ = tx.send(Bytes::from(recovery_sse));
     info!("[{}] OpenAI recovery injected", msg_id);
 }
 
@@ -475,7 +474,7 @@ async fn background_request_raw(
 async fn forward_raw_sse(
     response: reqwest::Response,
     msg_id: &str,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &UnboundedSender<Bytes>,
     mut stop_keepalive: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     use futures_util::StreamExt;
@@ -799,7 +798,7 @@ async fn forward_raw_sse(
                         }
                     }
                 }
-                if tx.send(Bytes::from(modified)).await.is_err() {
+                if tx.send(Bytes::from(modified)).is_err() {
                     break;
                 }
             }

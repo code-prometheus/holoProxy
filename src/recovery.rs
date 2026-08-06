@@ -1,23 +1,24 @@
-use tracing;
 use std::time::Duration;
+use tracing;
 
-/// 判断是否需要在 finish 时注入恢复工具
-/// 硬编码拦截 + LLM 智能判断双保险
-pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String> {
-    // 0. stop_reason == 'length' → API 明确告知被截断，总是需要恢复
+/// Fast-path hardcoded checks for recovery trigger.
+/// These run synchronously and cover the most common error patterns.
+/// Returns Some(reason) if recovery is needed, None if more analysis is required.
+fn hardcoded_checks(generated_text: &str, stop_reason: &str) -> Option<String> {
+    // 0. stop_reason == 'length' → API explicitly says truncated, always recover
     if stop_reason == "length" {
-        tracing::info!("🚨 [Recovery] stop_reason=length 触发恢复");
+        tracing::info!("🚨 [Recovery] stop_reason=length triggers recovery");
         return Some("stop_reason=length".into());
     }
 
-    // 1. 防止死循环：如果已经包含恢复/错误标记，直接不恢复
+    // 1. Prevent infinite loop: skip if recovery/error markers already present
     if generated_text.contains("[holoProxy Recovery") || generated_text.contains("[holoProxy Error") {
-        tracing::debug!("[Recovery] 检测到恢复/错误标记，跳过恢复防止死循环");
+        tracing::debug!("[Recovery] recovery/error markers detected, skip to prevent infinite loop");
         return None;
     }
 
-    // 2. 硬编码拦截 API 错误/超时/网关异常关键词
-    // 防止 LLM 将"完整的错误提示"误判为"正常结束 COMPLETE"
+    // 2. Hardcoded API error/timeout/gateway exception keyword interception
+    // Prevents LLM from misjudging "complete error messages" as "normal completion COMPLETE"
     let lower_text = generated_text.to_lowercase();
     let error_keywords = [
         "timed out", "empty or malformed response", "api error",
@@ -26,11 +27,11 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
         "proxy error", "internal server error", "connection refused",
         "connection reset", "network error", "request failed",
     ];
-    
+
     for keyword in &error_keywords {
         if lower_text.contains(keyword) {
             tracing::warn!(
-                "🚨 [Recovery] 硬编码拦截触发 | keyword={} | snippet={}",
+                "🚨 [Recovery] hardcoded intercept triggered | keyword={} | snippet={}",
                 keyword,
                 &generated_text[..generated_text.len().min(200)]
             );
@@ -38,63 +39,47 @@ pub fn should_recover(generated_text: &str, stop_reason: &str) -> Option<String>
         }
     }
 
-    // 3. 空文本或纯空白文本：视为异常中断，直接触发恢复
+    // 3. Empty or whitespace-only text: abnormal cutoff, trigger recovery
     if generated_text.trim().is_empty() {
-        tracing::warn!("[Recovery] 空文本或纯空白文本，触发恢复");
+        tracing::warn!("[Recovery] empty or whitespace-only text, trigger recovery");
         return Some("empty or whitespace-only text".into());
     }
 
-    // 4. 获取当前激活的 LLM 配置
+    // Need LLM semantic judgment
+    None
+}
+
+/// Async recovery check: hardcoded interception + LLM semantic judgment dual insurance.
+/// Called from StreamContext::finish() with tokio::time::timeout for non-blocking behavior.
+pub async fn should_recover_async(generated_text: &str, stop_reason: &str) -> Option<String> {
+    // Fast path: hardcoded checks (no I/O, completes instantly)
+    if let Some(reason) = hardcoded_checks(generated_text, stop_reason) {
+        return Some(reason);
+    }
+
+    // Slow path: consult LLM for semantic judgment
     let config = match crate::config::get_active_llm_config() {
         Some(c) => c,
         None => {
-            tracing::warn!("[Recovery] 无法获取 LLM 配置，保守策略：触发恢复");
+            tracing::warn!("[Recovery] cannot get LLM config, conservative: trigger recovery");
             return Some("no active LLM config, conservative recovery".into());
         }
     };
 
-    // 5. 开一个独立线程专门去咨询 LLM，避免阻塞主异步运行时
-    let text = generated_text.to_string();
-    let handle = std::thread::Builder::new()
-        .name("recovery-llm-check".into())
-        .spawn(move || {
-            tracing::info!(
-                "🔍 [Recovery] LLM 语义判断启动 | text_len={}B | model={}",
-                text.len(),
-                config.model_name
-            );
+    tracing::info!(
+        "🔍 [Recovery] LLM semantic check started | text_len={}B | model={}",
+        generated_text.len(),
+        config.model_name
+    );
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime for recovery check");
-
-            rt.block_on(async { ask_llm_if_incomplete(&text, &config).await })
-        })
-        .expect("failed to spawn recovery check thread");
-
-    // 6. 等待线程结果
-    match handle.join() {
-        Ok(Some(reason)) => {
-            tracing::info!("✅ [Recovery] LLM 判断结论：{}", reason);
-            Some(reason)
-        }
-        Ok(None) => {
-            tracing::debug!("✅ [Recovery] LLM 判断为正常结束，跳过恢复");
-            None
-        }
-        Err(_) => {
-            tracing::error!("❌ [Recovery] LLM 判断线程崩溃，保守策略：触发恢复");
-            Some("LLM check thread panicked, conservative recovery".into())
-        }
-    }
+    ask_llm_if_incomplete(generated_text, &config).await
 }
 
-/// 异步咨询 LLM 判断文本是否不完整
-/// 
-/// 返回 Some(reason) 表示需要恢复，None 表示正常结束
+/// Ask downstream LLM to judge whether text is incomplete.
+///
+/// Returns Some(reason) if recovery needed, None if normal completion.
 async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> Option<String> {
-    // 安全截取最后约 2000 字节，判断截断主要看结尾上下文，节省 Token
+    // Trim to last ~2000 bytes — judgment focuses on ending context, saves tokens
     let text_to_check = if text.len() > 2000 {
         let start = text.len().saturating_sub(2000);
         let mut safe_start = start;
@@ -108,7 +93,7 @@ async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> 
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
 
-    // 增强版 prompt：明确定义场景 + 详细判断标准 + 防误判指南
+    // Enhanced prompt: clearly defined scenarios + detailed criteria + anti-false-positive guide
     let system_prompt = r#"You are an expert AI Agent response quality analyzer for Claude Code proxy recovery system.
 Your CRITICAL task: Decide if a response needs emergency recovery (fake tool call injection) to prevent Claude Code from stopping.
 
@@ -172,13 +157,13 @@ No explanation, no punctuation, just the word."#;
         "stream": false
     });
 
-    // 构建带超时的客户端：增加连接池禁用和更严格的超时设置，防止连接复用导致的问题
+    // Build client with timeout — disable connection pool, strict timeouts
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(8))  // 8 秒总超时，防止 LLM 判断卡住
-        .connect_timeout(Duration::from_secs(3))  // 3 秒连接超时
-        .pool_max_idle_per_host(0)  // 禁用连接池，每次新建连接
-        .tcp_nodelay(true)  // 禁用 Nagle 算法，降低延迟
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
         .build()
         .unwrap_or_default();
 
@@ -193,33 +178,30 @@ No explanation, no punctuation, just the word."#;
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            // 检查 HTTP 状态码
             if !status.is_success() {
                 tracing::warn!(
-                    "❌ [Recovery] LLM 判断请求返回非成功状态码：status={} | url={}",
+                    "❌ [Recovery] LLM check returned non-success status: status={} | url={}",
                     status,
                     url
                 );
-                // 网络错误时保守策略：触发恢复（宁可误判不要漏判）
                 return Some(format!("LLM API returned non-success status {}, conservative recovery", status));
             }
-            
+
             match resp.json::<serde_json::Value>().await {
                 Ok(json) => {
-                    // 尝试从多种可能的位置提取回复内容，支持不同的 API 响应格式
                     let content = json["choices"][0]["message"]["content"]
                         .as_str()
                         .or_else(|| json["choices"][0]["message"]["content"].get("text").and_then(|v| v.as_str()))
                         .or_else(|| json["choices"][0].get("text").and_then(|v| v.as_str()))
                         .map(|s| s.trim())
                         .unwrap_or("");
-                    
+
                     if content.is_empty() {
-                        tracing::warn!("[Recovery] LLM 返回空内容，保守策略：触发恢复 | raw_json={}", 
+                        tracing::warn!("[Recovery] LLM returned empty content, conservative: trigger recovery | raw_json={}",
                             serde_json::to_string(&json).unwrap_or_default());
                         return Some("LLM returned empty content, conservative recovery".into());
                     }
-                    
+
                     let lower = content.to_lowercase();
                     let verdict = if lower.contains("incomplete") {
                         "INCOMPLETE"
@@ -228,69 +210,65 @@ No explanation, no punctuation, just the word."#;
                     } else {
                         "UNKNOWN"
                     };
-                    
+
                     tracing::info!(
-                        "🧠 [Recovery] LLM 判断结论 | verdict={} | raw_response={} | text_len={}B | model={}",
+                        "🧠 [Recovery] LLM verdict | verdict={} | raw_response={} | text_len={}B | model={}",
                         verdict,
                         content,
                         text.len(),
                         config.model_name
                     );
-                    
+
                     match verdict {
                         "INCOMPLETE" => {
-                            return Some(format!("LLM judged as INCOMPLETE: {}", content));
+                            Some(format!("LLM judged as INCOMPLETE: {}", content))
                         }
                         "COMPLETE" => {
-                            tracing::debug!("✅ [Recovery] LLM 判断为正常结束，跳过恢复");
-                            return None;
+                            tracing::debug!("✅ [Recovery] LLM judged as normal completion, skip recovery");
+                            None
                         }
                         _ => {
-                            // 无法识别 LLM 回复，保守策略：触发恢复
                             tracing::warn!(
-                                "⚠️ [Recovery] LLM 返回无法识别的格式：raw={}, 保守策略：触发恢复",
+                                "⚠️ [Recovery] LLM returned unrecognized format: raw={}, conservative: trigger recovery",
                                 content
                             );
-                            return Some(format!("LLM response unrecognizable: {}, conservative recovery", content));
+                            Some(format!("LLM response unrecognizable: {}, conservative recovery", content))
                         }
                     }
                 }
                 Err(parse_err) => {
                     tracing::warn!(
-                        "❌ [Recovery] LLM 响应解析失败：error={}, 保守策略：触发恢复 | status={}",
+                        "❌ [Recovery] LLM response parse failed: error={}, conservative: trigger recovery | status={}",
                         parse_err,
                         status
                     );
-                    // 解析失败时保守策略：触发恢复
                     Some(format!("LLM response parse failed: {}, conservative recovery", parse_err))
                 }
             }
         }
         Err(send_err) => {
-            // 发送失败（网络错误、超时等）
             let err_str = send_err.to_string();
-            let err_type = if send_err.is_timeout() { "timeout" } 
+            let err_type = if send_err.is_timeout() { "timeout" }
                 else if send_err.is_connect() { "connect_error" }
                 else if send_err.is_request() { "request_error" }
                 else { "other" };
             tracing::error!(
-                "❌ [Recovery] LLM 判断请求失败：error={} | type={} | url={}",
+                "❌ [Recovery] LLM check request failed: error={} | type={} | url={}",
                 err_str,
                 err_type,
                 url
             );
-            // 网络错误时保守策略：宁可误判也要确保 Claude Code 不停工
             Some(format!("LLM request failed ({}), conservative recovery", err_type))
         }
     }
 }
 
-/// 动态选取恢复工具：优先 Bash/Shell/RunCommand/Execute
+/// Dynamically select recovery tool: prioritize Bash/Shell/RunCommand/Execute.
 pub fn pick_recovery_tool(
     valid_tools: &std::collections::HashMap<String, &crate::types::ToolDef>,
 ) -> Option<(String, serde_json::Value)> {
     if valid_tools.is_empty() {
-        tracing::warn!("[Recovery] 没有可用工具，无法注入恢复工具调用");
+        tracing::warn!("[Recovery] no tools available, cannot inject recovery tool call");
         return None;
     }
     let priority_names = [
@@ -299,11 +277,11 @@ pub fn pick_recovery_tool(
     ];
     for name in &priority_names {
         if let Some(tool) = valid_tools.get(*name) {
-            tracing::info!("[Recovery] 选择优先级工具：name={}", name);
+            tracing::info!("[Recovery] selected priority tool: name={}", name);
             return Some((name.to_string(), build_recovery_args(tool)));
         }
     }
-    // 查找任何带有 command 参数的工具
+    // Find any tool with a command parameter
     for (name, tool) in valid_tools.iter() {
         let props = tool
             .input_schema
@@ -312,7 +290,7 @@ pub fn pick_recovery_tool(
             .and_then(|p| p.as_object());
         if let Some(props_map) = props {
             if props_map.contains_key("command") {
-                tracing::info!("[Recovery] 选择带 command 参数的工具：name={}", name);
+                tracing::info!("[Recovery] selected tool with command param: name={}", name);
                 return Some((
                     name.clone(),
                     serde_json::json!({
@@ -322,9 +300,9 @@ pub fn pick_recovery_tool(
             }
         }
     }
-    //  fallback: 选择第一个可用工具
+    // Fallback: first available tool
     let (name, tool) = valid_tools.iter().next().unwrap();
-    tracing::info!("[Recovery] 使用 fallback 工具：name={}", name);
+    tracing::info!("[Recovery] using fallback tool: name={}", name);
     Some((name.clone(), build_recovery_args(tool)))
 }
 
@@ -357,28 +335,27 @@ mod tests {
 
     #[test]
     fn test_should_recover_length() {
-        assert!(should_recover("some text", "length").is_some());
+        assert!(hardcoded_checks("some text", "length").is_some());
     }
 
     #[test]
     fn test_prevent_infinite_loop() {
-        assert!(should_recover("[holoProxy Recovery] some text", "stop").is_none());
+        assert!(hardcoded_checks("[holoProxy Recovery] some text", "stop").is_none());
     }
 
     #[test]
     fn test_empty_text_recovery() {
-        assert!(should_recover("", "stop").is_some());
-        assert!(should_recover(" \n\t ", "stop").is_some());
+        assert!(hardcoded_checks("", "stop").is_some());
+        assert!(hardcoded_checks(" \n\t ", "stop").is_some());
     }
 
     #[test]
     fn test_api_error_intercept() {
-        // 验证硬编码拦截 API 错误/超时关键词
-        assert!(should_recover("API Error: The operation timed out.", "stop").is_some());
-        assert!(should_recover("API Error: API returned an empty or malformed response (HTTP 200)", "stop").is_some());
-        assert!(should_recover("Some normal text. API Error occurred.", "stop").is_some());
-        assert!(should_recover("502 Bad Gateway", "stop").is_some());
-        assert!(should_recover("Connection refused", "stop").is_some());
-        assert!(should_recover("Internal Server Error", "stop").is_some());
+        assert!(hardcoded_checks("API Error: The operation timed out.", "stop").is_some());
+        assert!(hardcoded_checks("API Error: API returned an empty or malformed response (HTTP 200)", "stop").is_some());
+        assert!(hardcoded_checks("Some normal text. API Error occurred.", "stop").is_some());
+        assert!(hardcoded_checks("502 Bad Gateway", "stop").is_some());
+        assert!(hardcoded_checks("Connection refused", "stop").is_some());
+        assert!(hardcoded_checks("Internal Server Error", "stop").is_some());
     }
 }

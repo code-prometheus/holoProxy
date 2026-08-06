@@ -73,6 +73,7 @@ fn spawn_http_server() -> std::thread::JoinHandle<()> {
 
 fn main() {
     init_logging();
+    config::init_config();
 
     info!("🚀 holoProxy v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("📋 Listening on: 127.0.0.1:5430");

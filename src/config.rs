@@ -1,22 +1,72 @@
 use crate::types::{LLMConfig, Settings};
 use indexmap::IndexMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 use tracing::{error, info};
 
-/// Lazily-initialized path to the settings configuration file.
-/// Searches in order: executable directory, assets/, then current directory.
-static SETTINGS_PATH: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
+/// Global cached config — loaded once at startup, updated on model switch.
+static CONFIG: OnceLock<Arc<RwLock<Settings>>> = OnceLock::new();
+
+/// Initialize the global config cache. Must be called once at startup.
+pub fn init_config() {
+    let settings = Settings::load_from_disk();
+    info!(
+        "📋 Config loaded: active={} models={}",
+        settings.active_llm,
+        settings.llms.len()
+    );
+    CONFIG
+        .set(Arc::new(RwLock::new(settings)))
+        .expect("config already initialized");
+}
+
+/// Returns the path to settings.json, searching executable dir then cwd.
+fn settings_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
-        let p = exe.parent().unwrap_or(std::path::Path::new(".")).join("settings.json");
-        if p.exists() { return p; }
+        let p = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("settings.json");
+        if p.exists() {
+            return p;
+        }
     }
     let p = PathBuf::from("assets/settings.json");
-    if p.exists() { return p; }
+    if p.exists() {
+        return p;
+    }
     PathBuf::from("settings.json")
-});
+}
+
+/// Reads config from the cache (no disk I/O).
+fn with_config<F, R>(f: F) -> R
+where
+    F: FnOnce(&Settings) -> R,
+{
+    let guard = CONFIG
+        .get()
+        .expect("config not initialized — call init_config() first")
+        .read()
+        .expect("config RwLock poisoned");
+    f(&guard)
+}
+
+/// Mutates config in the cache + persists to disk.
+fn update_config<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Settings),
+{
+    let arc = CONFIG
+        .get()
+        .expect("config not initialized — call init_config() first");
+    let mut guard = arc.write().expect("config RwLock poisoned");
+    f(&mut guard);
+    guard
+        .save_to(&settings_path())
+        .map_err(|e| format!("Failed to save config: {}", e))
+}
 
 impl Settings {
-    /// Creates a default configuration with a single local LLM entry
     fn default_config() -> Self {
         let mut llms = IndexMap::new();
         llms.insert(
@@ -34,72 +84,82 @@ impl Settings {
                 stream: true,
             },
         );
-        Settings { active_llm: "默认本地大模型".into(), llms }
+        Settings {
+            active_llm: "默认本地大模型".into(),
+            llms,
+        }
     }
 
-    /// Loads settings from disk, creating defaults if file doesn't exist or is invalid
-    pub fn load() -> Self {
-        let path = SETTINGS_PATH.as_path();
+    /// Loads settings from disk, creating defaults if file doesn't exist or is invalid.
+    fn load_from_disk() -> Self {
+        let path = settings_path();
         if !path.exists() {
             info!("Generating default config: {}", path.display());
             let d = Self::default_config();
-            let _ = d.save_to(path);
+            let _ = d.save_to(&path);
             return d;
         }
-        match std::fs::read_to_string(path) {
+        match std::fs::read_to_string(&path) {
             Ok(data) => match serde_json::from_str::<Settings>(&data) {
                 Ok(cfg) => cfg,
-                Err(e) => { error!("Config parse error: {} — using default", e); Self::default_config() }
+                Err(e) => {
+                    error!("Config parse error: {} — using default", e);
+                    Self::default_config()
+                }
             },
-            Err(e) => { error!("Config read error: {} — using default", e); Self::default_config() }
+            Err(e) => {
+                error!("Config read error: {} — using default", e);
+                Self::default_config()
+            }
         }
     }
 
-    /// Persists current settings to disk
-    pub fn save(&self) {
-        let _ = self.save_to(SETTINGS_PATH.as_path());
-    }
-
-    /// Saves settings to a specific path
+    /// Atomic save: write to temp file, then rename to avoid corruption.
     fn save_to(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 }
 
-/// Returns all configured LLM names
+/// Returns all configured LLM names (from cache).
 pub fn get_llm_names() -> Vec<String> {
-    Settings::load().llms.keys().cloned().collect()
+    with_config(|s| s.llms.keys().cloned().collect())
 }
 
-/// Returns the name of the currently active LLM
+/// Returns the name of the currently active LLM (from cache).
 pub fn get_active_llm_name() -> String {
-    // Always loads fresh from disk to ensure latest state
-    Settings::load().active_llm
+    with_config(|s| s.active_llm.clone())
 }
 
-/// Returns the configuration of the active LLM, if available
+/// Returns the configuration of the active LLM, if available (from cache).
 pub fn get_active_llm_config() -> Option<LLMConfig> {
-    let s = Settings::load();
-    let key = &s.active_llm;
-    if key.is_empty() { return None; }
-    s.llms.get(key).cloned().or_else(|| {
-        error!("LLM '{}' not found in config", key);
-        None
+    with_config(|s| {
+        let key = &s.active_llm;
+        if key.is_empty() {
+            return None;
+        }
+        s.llms.get(key).cloned().or_else(|| {
+            error!("LLM '{}' not found in config", key);
+            None
+        })
     })
 }
 
-/// Switches the active LLM to the specified name
+/// Atomically switches the active LLM and persists to disk.
 pub fn switch_active_llm(name: &str) -> Result<(), String> {
-    // Loads fresh config from disk before modifying to avoid stale state
-    let mut s = Settings::load();
-    
-    if !s.llms.contains_key(name) {
+    // Validate existence before acquiring write lock
+    let exists = with_config(|s| s.llms.contains_key(name));
+    if !exists {
         return Err(format!("LLM '{}' not found", name));
     }
-    s.active_llm = name.to_string();
-    s.save();
+
+    update_config(|s| {
+        s.active_llm = name.to_string();
+    })?;
+
     info!("Switched active LLM → {}", name);
     Ok(())
 }

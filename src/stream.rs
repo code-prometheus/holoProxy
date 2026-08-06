@@ -3,6 +3,8 @@ use crate::types::*;
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -27,8 +29,8 @@ pub struct StreamContext {
     valid_triggers: HashMap<String, String>,
     // 原生 tool_calls 追踪
     active_native_tools: HashMap<u32, u32>,
-    // 输出缓冲区
-    output: Vec<Bytes>,
+    // 输出通道（流式发送，不缓冲）
+    tx: UnboundedSender<Bytes>,
 }
 
 impl StreamContext {
@@ -37,36 +39,29 @@ impl StreamContext {
         model_name: String,
         is_agent_mode: bool,
         valid_tools: HashMap<String, ToolDef>,
+        tx: UnboundedSender<Bytes>,
     ) -> Self {
+        // TWO detection paths for tool calls:
+        //
+        // Path A: ds2api-style DSML wrappers (normalized via normalize_dsml_tags())
+        //   <|DSML|tool_calls> → <tool_calls>, <DSML|invoke → <invoke
+        //
+        // Path B: Raw DeepSeek internal DSML format (also normalized)
+        //   <｜tool_calls_begin｜> → wrapper open
+        //   <｜tool_call_begin｜>  → individual call begin
+        //   <｜tool_sep｜>         → separator (ignored)
+        //   <｜tool_call_argument_begin｜> → args begin
+        //   <｜tool_call_end｜>    → individual call end
+        //   <｜tool_calls_end｜>   → wrapper close
+        //
+        // After normalization, only these canonical forms are checked:
+        //   <tool_calls → close="tool_calls" (wrapper)
+        //   <invoke    → close="invoke"    (tool call)
+        //   <parameter → close="parameter" (parameter)
         let mut valid_triggers: HashMap<String, String> = HashMap::new();
-        valid_triggers.insert("<tool_call>".into(), "</tool_call>".into());
-        valid_triggers.insert("```json".into(), "```".into());
-        valid_triggers.insert("```tool_call".into(), "```".into());
-        valid_triggers.insert("<｜tool_calls｜>".into(), "</｜tool_calls｜>".into());
-        valid_triggers.insert("<｜tool_call｜>".into(), "</｜tool_call｜>".into());
-        valid_triggers.insert("<ツtool_callsツ>".into(), "</ツtool_callsツ>".into());
-        valid_triggers.insert("<ツtool_callツ>".into(), "</ツtool_callツ>".into());
-        // invoke/parameter XML 格式
-        valid_triggers.insert("<invoke".into(), "</invoke>".into());
-        valid_triggers.insert("<｜invoke｜".into(), "</｜invoke｜>".into());
-
-        // DeepSeek DSML 格式 ▁(U+2581) 变体 — 模型实际输出格式
-        valid_triggers.insert("<｜tool▁calls▁begin｜>".into(), "<｜tool▁call▁end｜>".into());
-        valid_triggers.insert("<｜tool▁call▁begin｜>".into(), "<｜tool▁call▁end｜>".into());
-        // _(U+005F) 变体 — 部分上游可能做归一化
-        valid_triggers.insert("<｜tool_calls_begin｜>".into(), "<｜tool_call_end｜>".into());
-        valid_triggers.insert("<｜tool_call_begin｜>".into(), "<｜tool_call_end｜>".into());
-        // DSML 包装闭合标签 — 注册为自闭合触发，解析返回 unknown 自动跳过
-        valid_triggers.insert("<｜tool▁calls▁end｜>".into(), "<｜tool▁calls▁end｜>".into());
-        valid_triggers.insert("<｜tool_calls_end｜>".into(), "<｜tool_calls_end｜>".into());
-
-        // 为每个有效工具名添加触发标签
-        for name in valid_tools.keys() {
-            let lower = name.to_lowercase();
-            valid_triggers.insert(format!("<{}>", lower), format!("</{}>", lower));
-            valid_triggers.insert(format!("<{}>", name), format!("</{}>", name));
-            valid_triggers.insert(format!("```{}", lower), "```".into());
-        }
+        valid_triggers.insert("<tool_calls".into(), "tool_calls".into());
+        valid_triggers.insert("<invoke".into(), "invoke".into());
+        valid_triggers.insert("<parameter".into(), "parameter".into());
 
         let mut ctx = Self {
             msg_id,
@@ -85,7 +80,7 @@ impl StreamContext {
             active_close_tag: String::new(),
             valid_triggers,
             active_native_tools: HashMap::new(),
-            output: Vec::new(),
+            tx,
         };
 
         // 发送 message_start
@@ -109,17 +104,15 @@ impl StreamContext {
         ctx
     }
 
+    /// Send SSE event directly through the output channel (no buffering).
     fn send_event(&mut self, event_type: &str, data: &serde_json::Value) {
         let payload = format!(
             "event: {}\ndata: {}\n\n",
             event_type,
             serde_json::to_string(data).unwrap_or_default()
         );
-        self.output.push(Bytes::from(payload));
-    }
-
-    pub fn take_output(&mut self) -> Vec<Bytes> {
-        std::mem::take(&mut self.output)
+        // UnboundedSender::send is sync and infallible — only fails if receiver dropped
+        let _ = self.tx.send(Bytes::from(payload));
     }
 
     /// 刷新 text_buffer 中的缓冲文本（仅在非拦截模式下执行）
@@ -135,12 +128,12 @@ impl StreamContext {
         while self.intercept_active {
             let buffer = std::mem::take(&mut self.intercept_buffer);
 
-            // 尝试找到闭合标签；找不到则处理整个缓冲
-            let (full_xml, remaining) = if let Some(close_pos) =
-                buffer.find(&self.active_close_tag)
+            // 尝试找到闭合标签（DSML 规范化后匹配）；找不到则处理整个缓冲
+            let norm_buf = normalize_dsml_tags(&buffer);
+            let (full_xml, remaining) = if let Some(orig_end) =
+                find_close_tag_end_in_original(&buffer, &norm_buf, &self.active_close_tag)
             {
-                let end = close_pos + self.active_close_tag.len();
-                (buffer[..end].to_string(), buffer[end..].to_string())
+                (buffer[..orig_end].to_string(), buffer[orig_end..].to_string())
             } else {
                 (buffer, String::new())
             };
@@ -288,12 +281,14 @@ impl StreamContext {
             info!("[{}] 📝 content block START", self.msg_id);
         }
         if self.intercept_active {
-            // 拦截模式：收集到 active_close_tag 为止
+            // 拦截模式：收集到 active_close_tag（DSML 规范化后匹配）
             self.intercept_buffer.push_str(content);
-            if self.intercept_buffer.contains(&self.active_close_tag) {
-                let close_idx =
-                    self.intercept_buffer.find(&self.active_close_tag).unwrap()
-                        + self.active_close_tag.len();
+            let norm_buf = normalize_dsml_tags(&self.intercept_buffer);
+            if norm_buf.contains(&self.active_close_tag) {
+                let orig_end = find_close_tag_end_in_original(
+                    &self.intercept_buffer, &norm_buf, &self.active_close_tag,
+                );
+                let close_idx = orig_end.unwrap_or(self.intercept_buffer.len());
                 let full_xml = self.intercept_buffer[..close_idx].to_string();
                 let remaining = self.intercept_buffer[close_idx..].to_string();
 
@@ -335,45 +330,77 @@ impl StreamContext {
             return;
         }
 
-        // 找到最早出现的触发标签
-        let mut earliest_idx: Option<usize> = None;
-        let mut matched_open_tag: Option<&str> = None;
+        // DSML normalization: convert <|DSML|tag>, <|tool_calls_begin|>, CJK brackets, etc.
+        // to canonical <tag> before trigger matching (ds2api-compatible approach).
+        let normalized = normalize_dsml_tags(&self.text_buffer);
 
-        for (open_tag, _close_tag) in &self.valid_triggers {
-            if let Some(idx) = self.text_buffer.find(open_tag.as_str()) {
-                if earliest_idx.is_none() || idx < earliest_idx.unwrap() {
-                    earliest_idx = Some(idx);
-                    matched_open_tag = Some(open_tag);
+        // Step 1: find earliest trigger (immutable scan)
+        let trigger_info: Option<(usize, String)> = {
+            let mut earliest_idx: Option<usize> = None;
+            let mut matched_tag_base: Option<String> = None;
+
+            for (open_tag, close_tag_base) in &self.valid_triggers {
+                if let Some(idx) = normalized.find(open_tag.as_str()) {
+                    if earliest_idx.is_none() || idx < earliest_idx.unwrap() {
+                        earliest_idx = Some(idx);
+                        matched_tag_base = Some(close_tag_base.clone());
+                    }
                 }
             }
-        }
 
-        if let (Some(idx), Some(open_tag)) = (earliest_idx, matched_open_tag) {
-            let close_tag = self.valid_triggers.get(open_tag).cloned().unwrap_or_default();
+            earliest_idx.map(|idx| (idx, matched_tag_base.unwrap()))
+        };
 
-            // 空闭合标签守卫：防止 contains("") 恒为 true
-            if close_tag.is_empty() {
+        // Step 2: process trigger (mutable operations)
+        if let Some((idx, tag_base)) = trigger_info {
+            let close_tag = format!("</{}", tag_base);
+            if tag_base.is_empty() {
                 return;
             }
 
-            // 发送 open_tag 之前的文本
+            // Send text BEFORE the trigger (from normalized positions)
             if idx > 0 {
-                let pre_text = self.text_buffer[..idx].to_string();
+                let pre_text = normalized[..idx].to_string();
                 self.send_text_delta(&pre_text);
             }
 
+            // Map normalized position back to original text for intercept buffer
+            let orig_idx = self.find_original_tag_pos(&normalized, idx, &tag_base);
             self.intercept_active = true;
             self.active_close_tag = close_tag;
-            self.intercept_buffer = self.text_buffer[idx..].to_string();
+            self.intercept_buffer = self.text_buffer[orig_idx..].to_string();
             self.text_buffer.clear();
         } else if self.text_buffer.len() > 50 {
-            // 缓冲够大且没有触发标签 → 发送文本（保留尾部 50 字节防止截断多字节 DSML 标签）
             let safe_cut = self.text_buffer.len() - 50;
             let send_len = self.text_buffer.floor_char_boundary(safe_cut);
             let send_text = self.text_buffer[..send_len].to_string();
             self.send_text_delta(&send_text);
             self.text_buffer = self.text_buffer[send_len..].to_string();
         }
+    }
+
+    /// Map normalized trigger position back to original text position.
+    /// Scans for the first occurrence of the tag pattern in original text
+    /// starting from the mapped position.
+    fn find_original_tag_pos(&self, _normalized: &str, norm_idx: usize, open_tag_base: &str) -> usize {
+        // Simple heuristic: normalized and original differ only in DSML prefix chars,
+        // so original position ≈ norm_idx + (prefix chars already consumed).
+        // For robustness, scan the original buffer near the expected position.
+        let estimated = norm_idx.min(self.text_buffer.len());
+        // Search backward from estimate for the '<' that starts the tag
+        let search_start = estimated.saturating_sub(30);
+        let search_slice = &self.text_buffer[search_start..];
+        if let Some(pos) = search_slice.find('<') {
+            let orig_pos = search_start + pos;
+            // Verify: after normalizing, this position should produce the canonical tag
+            let test = normalize_dsml_tags(&self.text_buffer[orig_pos..]);
+            let expected = format!("<{}", open_tag_base);
+            if test.starts_with(&expected) {
+                return orig_pos;
+            }
+        }
+        // Fallback: use estimate
+        estimated
     }
 
     /// 处理原生 tool_calls delta
@@ -448,8 +475,9 @@ impl StreamContext {
         }
     }
 
-    /// 结束流：关闭所有开放块 + 自动恢复判断 + 发送 message_delta/message_stop
-    pub fn finish(&mut self, upstream_stop_reason: &str) {
+    /// 结束流：关闭所有开放块 + 自动恢复判断 + 发送 message_delta/message_stop。
+    /// 现在是异步的 — recovery LLM 检查使用 tokio::time::timeout 避免阻塞。
+    pub async fn finish(&mut self, upstream_stop_reason: &str) {
         // 保底：防止空响应（只考虑 text/tool/thinking）
         if !self.text_open && !self.thinking_open && !self.has_tool_use {
             self.send_text_delta(" ");
@@ -474,25 +502,44 @@ impl StreamContext {
         self.active_native_tools.clear();
 
         // Agent 模式下的自动恢复判断（硬编码拦截 + LLM 语义判断双保险）
+        // 使用 tokio::time::timeout 防止 recovery LLM 调用阻塞 SSE 流
         if self.is_agent_mode && !self.has_tool_use {
-            if let Some(_reason) = recovery::should_recover(&self.generated_text, upstream_stop_reason)
-            {
-                let tool_refs: HashMap<String, &ToolDef> = self
-                    .valid_tools
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v))
-                    .collect();
-                if let Some((target_name, target_args)) =
-                    recovery::pick_recovery_tool(&tool_refs)
-                {
-                    self.send_text_delta("[holoProxy Recovery Injected]");
-                    self.close_text();
-                    let tool_id = gen_tool_id();
-                    self.open_tool(&tool_id, &target_name);
-                    let args_str =
-                        serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".into());
-                    self.send_tool_delta(&args_str);
-                    self.close_tool();
+            let recovery_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                recovery::should_recover_async(&self.generated_text, upstream_stop_reason),
+            )
+            .await;
+
+            match recovery_result {
+                Ok(Some(reason)) => {
+                    info!("[{}] 🚨 Recovery triggered: {}", self.msg_id, reason);
+                    let tool_refs: HashMap<String, &ToolDef> = self
+                        .valid_tools
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v))
+                        .collect();
+                    if let Some((target_name, target_args)) =
+                        recovery::pick_recovery_tool(&tool_refs)
+                    {
+                        self.send_text_delta("[holoProxy Recovery Injected]");
+                        self.close_text();
+                        let tool_id = gen_tool_id();
+                        self.open_tool(&tool_id, &target_name);
+                        let args_str =
+                            serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".into());
+                        self.send_tool_delta(&args_str);
+                        self.close_tool();
+                    }
+                }
+                Ok(None) => {
+                    // 正常结束 — 无需恢复
+                }
+                Err(_elapsed) => {
+                    // Recovery 检查超时 — 假设正常结束
+                    info!(
+                        "[{}] ⏰ Recovery check timed out after 5s, assuming normal completion",
+                        self.msg_id
+                    );
                 }
             }
         }
@@ -518,8 +565,9 @@ impl StreamContext {
         );
     }
 
-    /// 发送错误消息并完成 SSE 流
-    pub fn send_error(&mut self, msg: &str) {
+    /// 发送错误消息并完成 SSE 流。
+    /// Agent 模式下无条件注入 fake tool，防止 Claude Code 报 API Error。
+    pub async fn send_error(&mut self, msg: &str) {
         self.flush_text_buffer();
         self.send_text_delta(msg);
         self.close_thinking();
@@ -544,7 +592,181 @@ impl StreamContext {
                 self.close_tool();
             }
         }
-        self.finish("end_turn");
+        self.finish("end_turn").await;
+    }
+}
+
+/// Normalize DSML tags to canonical XML form for trigger detection.
+///
+/// Handles TWO formats:
+///
+///   A) ds2api-style DSML wrappers:
+///      `<|DSML|tool_calls>` → `<tool_calls>`
+///      `<DSML|invoke`       → `<invoke`
+///      `〈DSML|parameter〉`   → `<parameter>`
+///
+///   B) Raw DeepSeek internal DSML format:
+///      `<｜tool_calls_begin｜>`            → `<tool_calls>`
+///      `<｜tool_call_begin｜>`             → `<invoke`
+///      `<｜tool_sep｜>`                    → stripped
+///      `<｜tool_call_argument_begin｜>`    → stripped
+///      `<｜tool_call_end｜>`               → `</invoke>`
+///      `<｜tool_calls_end｜>`              → `</tool_calls>`
+///
+/// CJK brackets (〈〉), fullwidth punctuation (！｜ etc.) are also normalized.
+fn normalize_dsml_tags(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Step 0: Normalize CJK brackets and fullwidth ASCII
+    let tmp = text.replace('〈', "<").replace('〉', ">");
+    let tmp = normalize_fullwidth_ascii(&tmp);
+
+    // Step 1: Handle ds2api-style wrappers: strip DSML prefix from <|DSML|tag → <tag
+    static RE_DSML_WRAPPER: OnceLock<Regex> = OnceLock::new();
+    let re_wrapper = RE_DSML_WRAPPER.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+            [<]+
+            (?:[|\s！、\u{2581}]*(?:DSML|dsml|DSMARTTOOLCALLS|DSM|dsmarttoolcalls)[|\s！、\u{2581}]*)?
+            (/)?
+            \s*
+            (tool_calls|tool_calls_begin|tool_calls_end|tool_call_begin|tool_call_end|invoke|parameter)
+            "
+        )
+        .unwrap()
+    });
+
+    // Step 2: Map raw DeepSeek internal tag names to canonical form
+    static RE_DEEPSEEK_INTERNAL: OnceLock<Regex> = OnceLock::new();
+    let re_internal = RE_DEEPSEEK_INTERNAL.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+            [<]+
+            [|]*
+            (/?)
+            \s*
+            (tool_calls_begin|tool_calls_end|tool_call_begin|tool_call_end|tool_sep|tool_call_argument_begin)
+            [|]*
+            [>]*
+            "
+        )
+        .unwrap()
+    });
+
+    // Step 1: strip DSML prefix
+    let result = re_wrapper.replace_all(&tmp, |caps: &regex::Captures| {
+        let _slash = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let tag = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        // Map internal names to canonical
+        let canonical = match tag {
+            "tool_calls_begin" => "tool_calls",
+            "tool_calls_end" => "/tool_calls",
+            "tool_call_begin" => "invoke",
+            "tool_call_end" => "/invoke",
+            "tool_sep" => "",
+            "tool_call_argument_begin" => "",
+            other => other,
+        };
+        if canonical.is_empty() {
+            String::new()
+        } else if canonical.starts_with('/') {
+            format!("</{}>", &canonical[1..])
+        } else {
+            format!("<{}", canonical)
+        }
+    }).to_string();
+
+    // Step 2: handle raw DeepSeek internal tags that survived Step 1
+    let result = re_internal.replace_all(&result, |caps: &regex::Captures| {
+        let _slash = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let tag = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        match tag {
+            "tool_calls_begin" => "<tool_calls>".to_string(),
+            "tool_calls_end" => "</tool_calls>".to_string(),
+            "tool_call_begin" => "<invoke".to_string(),
+            "tool_call_end" => "</invoke>".to_string(),
+            "tool_sep" | "tool_call_argument_begin" => String::new(),
+            _ => caps.get(0).unwrap().as_str().to_string(),
+        }
+    }).to_string();
+
+    result
+}
+
+/// Normalize fullwidth ASCII characters to their basic ASCII equivalents.
+fn normalize_fullwidth_ascii(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '！' => '!',
+            '＂' => '"',
+            '＃' => '#',
+            '＄' => '$',
+            '％' => '%',
+            '＆' => '&',
+            '＼' => '\'',
+            '（' => '(',
+            '）' => ')',
+            '＊' => '*',
+            '＋' => '+',
+            '，' => ',',
+            '－' => '-',
+            '．' => '.',
+            '／' => '/',
+            '：' => ':',
+            '；' => ';',
+            '＜' => '<',
+            '＝' => '=',
+            '＞' => '>',
+            '？' => '?',
+            '＠' => '@',
+            '［' => '[',
+            '］' => ']',
+            '＾' => '^',
+            '＿' => '_',
+            '｀' => '`',
+            '｛' => '{',
+            '｜' => '|',
+            '｝' => '}',
+            '～' => '~',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Parse close tag from normalized intercept buffer, map position back to original text.
+/// Returns byte index AFTER the close tag in the ORIGINAL (raw) text.
+fn find_close_tag_end_in_original(original: &str, norm_canonical: &str, close_tag: &str) -> Option<usize> {
+    let norm_pos = norm_canonical.find(close_tag)?;
+    let norm_end = norm_pos + close_tag.len();
+
+    // Walk through original and normalized in parallel to map the position
+    let orig_chars: Vec<(usize, char)> = original.char_indices().collect();
+    let norm_chars: Vec<char> = norm_canonical.chars().collect();
+
+    let mut oi = 0usize; // index into orig_chars
+    let mut ni = 0usize; // index into norm_chars
+
+    while ni < norm_end && oi < orig_chars.len() {
+        let (_, oc) = orig_chars[oi];
+        if ni < norm_chars.len() {
+            let nc = norm_chars[ni];
+            if normalize_fullwidth_ascii(&oc.to_string()) == nc.to_string() {
+                oi += 1;
+                ni += 1;
+            } else {
+                // Original char is part of DSML prefix/noise that gets normalized away
+                oi += 1;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if oi <= orig_chars.len() {
+        Some(orig_chars[..oi].iter().map(|(_, c)| c.len_utf8()).sum())
+    } else {
+        None
     }
 }
 
@@ -557,11 +779,11 @@ pub fn parse_fallback_tool(
     text: &str,
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {
-    // 归一化：将 DeepSeek 的 ▁(U+2581) 统一为 _(U+005F)，后续解析全部使用 _ 变体
+    // Normalize: DeepSeek ▁(U+2581) → _(U+005F), subsequent parsing uses _ variant
     let normalized = text.replace('▁', "_");
     let text = normalized.as_str();
 
-    // DeepSeek DSML 格式:
+    // Raw DeepSeek DSML format (fullwidth pipes ｜ U+FF5C):
     // <｜tool_call_begin｜>function<｜tool_sep｜>name<｜tool_call_argument_begin｜>{json}<｜tool_call_end｜>
     const DSML_SEP: &str = "<｜tool_sep｜>";
     const DSML_ARG_BEGIN: &str = "<｜tool_call_argument_begin｜>";
@@ -615,10 +837,9 @@ pub fn parse_fallback_tool(
         }
     }
 
-    // invoke XML 属性格式: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
-    // 支持多参数: <invoke name="edit"><parameter name="filePath">...</parameter><parameter name="newString">...</parameter></invoke>
+    // invoke XML attribute format: <invoke name="Bash"><parameter name="command">dir</parameter></invoke>
     let lower_text = text.to_lowercase();
-    if let Some(invoke_start) = lower_text.find("<invoke").or_else(|| text.find("<｜invoke｜")) {
+    if let Some(invoke_start) = lower_text.find("<invoke") {
         // 取 invoke 的 name="..." 属性
         if let Some(name_start) = text[invoke_start..].find("name=\"") {
             let name_val_start = invoke_start + name_start + 6;
