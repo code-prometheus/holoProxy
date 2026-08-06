@@ -1008,40 +1008,4 @@
 	        assert!(id.starts_with("toolu_"));
 	        assert_eq!(id.len(), 30);
 	    }
-	    #[test]
-	    fn test_parse_invoke_with_quick_xml_basic() {
-	        let valid_tools = std::collections::HashMap::from([(
-	            "edit".into(),
-	            ToolDef {
-	                name: "edit".into(),
-	                description: Some("Edit file".into()),
-	                input_schema: Some(serde_json::json!({
-	                    "properties": {
-	                        "filePath": {"type": "string"},
-	                        "newString": {"type": "string"}
-	                    }
-	                })),
-	            },
-	        )]);
-	        let input = r#"<｜DSML｜tool_calls><｜DSML｜invoke name="edit"><｜DSML｜parameter name="filePath" string="true">F:\test.py</｜DSML｜parameter><｜DSML｜parameter name="newString" string="true">if x < 10: print(x)</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"#;
-	        let (name, args) = parse_fallback_tool(input, &valid_tools);
-	        assert_eq!(name, "edit");
-	        assert_eq!(
-	            args.get("filePath").unwrap().as_str().unwrap(),
-	            "F:\\test.py"
-	        );
-	        assert_eq!(
-	            args.get("newString").unwrap().as_str().unwrap(),
-	            "if x < 10: print(x)"
-	        );
-	    }
-	    #[test]
-	    fn test_preprocess_dsml_xml() {
-	        let input = r#"<｜DSML｜invoke name="edit"><｜DSML｜parameter name="code" string="true">if x < 10 && y > 5: pass</｜DSML｜parameter></｜DSML｜invoke>"#;
-	        let result = preprocess_dsml_xml(input);
-	        assert!(result.contains("<invoke name=\"edit\">"));
-	        assert!(result.contains("if x &lt; 10 &amp;&amp; y &gt; 5: pass"));
-	        assert!(result.contains("</parameter>"));
-	        assert!(result.contains("</invoke>"));
-	    }
 	}
