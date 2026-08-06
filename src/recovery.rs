@@ -1,4 +1,3 @@
-use std::time::Duration;
 use tracing;
 
 /// Fast-path hardcoded checks for recovery trigger.
@@ -91,7 +90,12 @@ async fn ask_llm_if_incomplete(text: &str, config: &crate::types::LLMConfig) -> 
         text.to_string()
     };
 
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let base = config.base_url.trim_end_matches('/');
+    let url = if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{}/chat/completions", base)
+    };
 
     // Enhanced prompt: clearly defined scenarios + detailed criteria + anti-false-positive guide
     let system_prompt = r#"You are an expert AI Agent response quality analyzer for Claude Code proxy recovery system.
@@ -157,15 +161,8 @@ No explanation, no punctuation, just the word."#;
         "stream": false
     });
 
-    // Build client with timeout — disable connection pool, strict timeouts
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(3))
-        .pool_max_idle_per_host(0)
-        .tcp_nodelay(true)
-        .build()
-        .unwrap_or_default();
+    // Build client with timeout — reuse server's fresh_client for consistency
+    let client = crate::server::fresh_client();
 
     let req = client
         .post(&url)

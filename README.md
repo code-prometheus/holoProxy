@@ -2,20 +2,16 @@
 
 **Claude Code API 代理 — Rust 实现**
 
-将 Claude Code 的 Anthropic Messages API 透明转发到任意 OpenAI 兼容 LLM，同时提供 OpenAI 透传端点。支持流式 SSE、工具调用、reasoning/thinking 处理、智能恢复、Windows 系统托盘。
+将 Claude Code 的 Anthropic Messages API 透明转发到任意 OpenAI 兼容 LLM。支持流式 SSE、工具调用、reasoning/thinking 处理、智能恢复、Windows 系统托盘。
 
 [![CI](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/code-prometheus/holoProxy/actions/workflows/ci.yml)
 
 ## 功能
 
-- **双协议端点**：
-  - `POST /v1/messages` — Anthropic Messages API → OpenAI 协议转换
-  - `POST /v1/chat/completions` — OpenAI API 直接透传（自动替换 model + reasoning → `<thinking>` 标签 + XML/DSML 工具调用拦截）
-- **SSE 流处理**：完整状态机，原生 tool_calls + XML/DSML 工具调用拦截双通道
-- **reasoning/thinking 支持**：
-  - Anthropic 路径：`delta.reasoning` / `delta.reasoning_content` → 独立 thinking content_block
-  - OpenAI 透传路径：reasoning 流式输出 `<thinking>` 标签
-  - 日志标记 `💭 reasoning` / `📝 content` / `🔧 XML/DSML tool_call` 区分输出类型
+- **Anthropic → OpenAI 协议转换**：`POST /v1/messages` — Anthropic Messages API → OpenAI Chat Completions，完整 SSE 状态机
+- **SSE 流处理**：原生 tool_calls + XML/DSML（全角管道 `｜`、U+2581 `▁` 分隔符）工具调用拦截双通道
+- **reasoning/thinking 支持**：`delta.reasoning` / `delta.reasoning_content` → 独立 thinking content_block
+- **日志标记** `💭 reasoning` / `📝 content` / `🔧 XML/DSML tool_call` 区分输出类型
 - **配置驱动**：`thinking`、`reasoning_effort`、`stream`、`chat_template_kwargs` 均可在 settings.json 中按模型独立配置
 - **标准兼容**：`thinking=false` 时不注入 `chat_template_kwargs`，发送标准 OpenAI body
 - **Tools Instruction 注入**：不支持原生 function calling 的模型自动注入 XML 格式指令
@@ -79,14 +75,12 @@
 ### 4. 配置客户端
 
 - **Claude Code**：API endpoint → `http://127.0.0.1:5430`（自动使用 `/v1/messages`）
-- **OpenAI 客户端**：API endpoint → `http://127.0.0.1:5430/v1/chat/completions`
 
 ## API 端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/messages` | Anthropic Messages API（自动转 OpenAI） |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions API（透传 + reasoning + XML 拦截） |
 | GET | `/v1/models` | 获取可用模型列表 |
 | POST | `/v1/select_model` | 切换激活模型 |
 

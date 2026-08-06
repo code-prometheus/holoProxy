@@ -804,7 +804,7 @@
 	// parse_fallback_tool（invoke XML 部分改用 quick-xml）
 	// ============================================================
 	/// 解析 fallback XML/JSON 工具调用（公开，供 OpenAI 透传路径复用）
-	pub fn parse_fallback_tool(
+	fn parse_fallback_tool(
 	    text: &str,
 	    valid_tools: &HashMap<String, ToolDef>,
 	) -> (String, serde_json::Value) {
