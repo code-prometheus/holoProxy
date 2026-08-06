@@ -242,16 +242,22 @@
 	        }
 	        if self.intercept_active {
 	            self.intercept_buffer.push_str(content);
-	            let norm_buf = normalize_dsml_tags(&self.intercept_buffer);
-	            if norm_buf.contains(&self.active_close_tag) {
+	            // 性能优化：仅对尾部 100 字节进行 normalize 以检查闭合标签
+	            let check_len = 100.min(self.intercept_buffer.len());
+	            let start = self.intercept_buffer.len() - check_len;
+	            let start = self.intercept_buffer.floor_char_boundary(start);
+	            let tail = &self.intercept_buffer[start..];
+	            let norm_tail = normalize_dsml_tags(tail);
+	            if norm_tail.contains(&self.active_close_tag) {
+	                // 检测到闭合标签，处理整个 buffer
+	                let norm_buf = normalize_dsml_tags(&self.intercept_buffer);
 	                let orig_end = find_close_tag_end_in_original(
 	                    &self.intercept_buffer,
 	                    &norm_buf,
 	                    &self.active_close_tag,
-	                );
-	                let close_idx = orig_end.unwrap_or(self.intercept_buffer.len());
-	                let full_xml = self.intercept_buffer[..close_idx].to_string();
-	                let remaining = self.intercept_buffer[close_idx..].to_string();
+	                ).unwrap_or(self.intercept_buffer.len());
+	                let full_xml = self.intercept_buffer[..orig_end].to_string();
+	                let remaining = self.intercept_buffer[orig_end..].to_string();
 	                let (tool_name, tool_args) = parse_fallback_tool(&full_xml, &self.valid_tools);
 	                if tool_name != "unknown" && self.valid_tools.contains_key(&tool_name) {
 	                    let tool_id = gen_tool_id();
@@ -286,6 +292,14 @@
 	        if self.intercept_active {
 	            return;
 	        }
+	        // 快速路径：如果没有 '<'，直接发送（除非很小）
+	        if !self.text_buffer.contains('<') {
+	            if self.text_buffer.len() > 50 {
+	                let send_text = std::mem::take(&mut self.text_buffer);
+	                self.send_text_delta(&send_text);
+	            }
+	            return;
+	        }
 	        let normalized = normalize_dsml_tags(&self.text_buffer);
 	        // Step 1: find earliest trigger (immutable scan)
 	        let trigger_info: Option<(usize, String)> = {
@@ -303,12 +317,27 @@
 	        };
 	        // Step 2: process trigger (mutable operations)
 	        if let Some((idx, tag_base)) = trigger_info {
+	            if tag_base == "tool_calls" {
+	                // 跳过 tool_calls 包装标签，继续寻找 invoke
+	                let orig_idx = self.find_original_tag_pos(&normalized, idx, "tool_calls");
+	                let orig_rest = self.text_buffer.floor_char_boundary(orig_idx);
+	                let orig_slice = &self.text_buffer[orig_rest..];
+	                let skip_len = orig_slice.find('>').map(|p| p + 1)
+	                    .or_else(|| orig_slice.find("｜>").map(|p| p + "｜>".len()))
+	                    .or_else(|| orig_slice.find("|>").map(|p| p + "|>".len()))
+	                    .unwrap_or(orig_slice.len());
+	                let cut_pos = orig_rest + skip_len;
+	                let cut_pos = self.text_buffer.floor_char_boundary(cut_pos);
+	                self.text_buffer = self.text_buffer[cut_pos..].to_string();
+	                return self.check_text_buffer_triggers();
+	            }
 	            let close_tag = format!("</{}", tag_base);
 	            if tag_base.is_empty() {
 	                return;
 	            }
 	            if idx > 0 {
-	                let pre_text = normalized[..idx].to_string();
+	                let orig_idx = self.find_original_tag_pos(&normalized, idx, &tag_base);
+	                let pre_text = self.text_buffer[..orig_idx].to_string();
 	                self.send_text_delta(&pre_text);
 	            }
 	            let orig_idx = self.find_original_tag_pos(&normalized, idx, &tag_base);
@@ -316,12 +345,19 @@
 	            self.active_close_tag = close_tag;
 	            self.intercept_buffer = self.text_buffer[orig_idx..].to_string();
 	            self.text_buffer.clear();
-	        } else if self.text_buffer.len() > 50 {
-	            let safe_cut = self.text_buffer.len() - 50;
-	            let send_len = self.text_buffer.floor_char_boundary(safe_cut);
-	            let send_text = self.text_buffer[..send_len].to_string();
-	            self.send_text_delta(&send_text);
-	            self.text_buffer = self.text_buffer[send_len..].to_string();
+	        } else {
+	            let len = self.text_buffer.len();
+	            if len > 50 {
+	                let safe_cut = len - 50;
+	                // 在最后 50 字节里找最后一个 '<'，保留它及之后的内容
+	                let cut_pos = self.text_buffer[safe_cut..].rfind('<').map(|i| safe_cut + i).unwrap_or(safe_cut);
+	                let send_len = self.text_buffer.floor_char_boundary(cut_pos);
+	                if send_len > 0 {
+	                    let send_text = self.text_buffer[..send_len].to_string();
+	                    self.send_text_delta(&send_text);
+	                    self.text_buffer = self.text_buffer[send_len..].to_string();
+	                }
+	            }
 	        }
 	    }
 	    /// Map normalized trigger position back to original text position.
@@ -332,11 +368,16 @@
 	        open_tag_base: &str,
 	    ) -> usize {
 	        let estimated = norm_idx.min(self.text_buffer.len());
-	        let search_start = self.text_buffer.floor_char_boundary(estimated.saturating_sub(30));
-	        let search_slice = &self.text_buffer[search_start..];
+	        // 在 estimated 前后 30 字节搜索 '<'
+	        let start = estimated.saturating_sub(30);
+	        let start = self.text_buffer.floor_char_boundary(start);
+	        let end = (estimated + 30).min(self.text_buffer.len());
+	        let search_slice = &self.text_buffer[start..end];
 	        if let Some(pos) = search_slice.find('<') {
-	            let orig_pos = search_start + pos;
-	            let test = normalize_dsml_tags(&self.text_buffer[orig_pos..]);
+	            let orig_pos = start + pos;
+	            let test_len = 50.min(self.text_buffer.len() - orig_pos);
+	            let test_slice = &self.text_buffer[orig_pos..orig_pos + test_len];
+	            let test = normalize_dsml_tags(test_slice);
 	            let expected = format!("<{}", open_tag_base);
 	            if test.starts_with(&expected) {
 	                return orig_pos;
@@ -517,7 +558,9 @@
 	/// Normalize DSML tags to canonical XML form for trigger detection.
 	fn normalize_dsml_tags(text: &str) -> String {
 	    use std::sync::OnceLock;
-	    let tmp = text.replace('〈', "<").replace('〉', ">");
+	    // 关键修复：替换 DeepSeek 常用的特殊下划线
+	    let tmp = text.replace('▁', "_");
+	    let tmp = tmp.replace('〈', "<").replace('〉', ">");
 	    let tmp = normalize_fullwidth_ascii(&tmp);
 	    static RE_DSML_WRAPPER: OnceLock<Regex> = OnceLock::new();
 	    let re_wrapper = RE_DSML_WRAPPER.get_or_init(|| {
@@ -528,6 +571,8 @@
 	            (/)?
 	            \s*
 	            (tool_calls|tool_calls_begin|tool_calls_end|tool_call_begin|tool_call_end|invoke|parameter)
+	            [|\s！、\u{2581}]*
+	            [>]*
 	            ",
 	        )
 	        .unwrap()
@@ -564,7 +609,7 @@
 	            } else if canonical.starts_with('/') {
 	                format!("</{}>", &canonical[1..])
 	            } else {
-	                format!("<{}", canonical)
+	                format!("<{}>", canonical)
 	            }
 	        })
 	        .to_string();
@@ -585,40 +630,16 @@
 	}
 	/// Normalize fullwidth ASCII characters to their basic ASCII equivalents.
 	fn normalize_fullwidth_ascii(text: &str) -> String {
+	    if !text.contains(|c: char| c >= '！' && c <= '～') {
+	        return text.to_string();
+	    }
 	    text.chars()
-	        .map(|c| match c {
-	            '！' => '!',
-	            '＂' => '"',
-	            '＃' => '#',
-	            '＄' => '$',
-	            '％' => '%',
-	            '＆' => '&',
-	            '＼' => '\\',
-	            '（' => '(',
-	            '）' => ')',
-	            '＊' => '*',
-	            '＋' => '+',
-	            '，' => ',',
-	            '－' => '-',
-	            '．' => '.',
-	            '／' => '/',
-	            '：' => ':',
-	            '；' => ';',
-	            '＜' => '<',
-	            '＝' => '=',
-	            '＞' => '>',
-	            '？' => '?',
-	            '＠' => '@',
-	            '［' => '[',
-	            '］' => ']',
-	            '＾' => '^',
-	            '＿' => '_',
-	            '｀' => '`',
-	            '｛' => '{',
-	            '｜' => '|',
-	            '｝' => '}',
-	            '～' => '~',
-	            _ => c,
+	        .map(|c| {
+	            if c >= '！' && c <= '～' {
+	                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+	            } else {
+	                c
+	            }
 	        })
 	        .collect()
 	}
@@ -630,30 +651,26 @@
 	) -> Option<usize> {
 	    let norm_pos = norm_canonical.find(close_tag)?;
 	    let norm_end_bytes = norm_pos + close_tag.len();
-	    let norm_end = norm_canonical[..norm_end_bytes].chars().count();
-	    let orig_chars: Vec<(usize, char)> = original.char_indices().collect();
-	    let norm_chars: Vec<char> = norm_canonical.chars().collect();
-	    let mut oi = 0usize;
+	    let norm_end_chars = norm_canonical[..norm_end_bytes].chars().count();
+	    let mut orig_iter = original.char_indices();
+	    let mut norm_iter = norm_canonical.chars();
 	    let mut ni = 0usize;
-	    while ni < norm_end && oi < orig_chars.len() {
-	        let (_, oc) = orig_chars[oi];
-	        if ni < norm_chars.len() {
-	            let nc = norm_chars[ni];
-	            if normalize_fullwidth_ascii(&oc.to_string()) == nc.to_string() {
-	                oi += 1;
-	                ni += 1;
+	    let mut last_orig_byte = 0;
+	    while ni < norm_end_chars {
+	        if let Some((oi, oc)) = orig_iter.next() {
+	            last_orig_byte = oi + oc.len_utf8();
+	            if let Some(nc) = norm_iter.next() {
+	                if normalize_fullwidth_ascii(&oc.to_string()) == nc.to_string() {
+	                    ni += 1;
+	                }
 	            } else {
-	                oi += 1;
+	                break;
 	            }
 	        } else {
 	            break;
 	        }
 	    }
-	    if oi <= orig_chars.len() {
-	        Some(orig_chars[..oi].iter().map(|(_, c)| c.len_utf8()).sum())
-	    } else {
-	        None
-	    }
+	    Some(last_orig_byte)
 	}
 	pub fn gen_tool_id() -> String {
 	    format!(
@@ -662,30 +679,18 @@
 	    )
 	}
 	// ============================================================
-	// DSML 专用预处理 + quick-xml 解析（新增）
+	// DSML 专用预处理 + quick-xml 解析
 	// ============================================================
 	/// DSML 专用预处理：
-	/// 1. 全角字符转半角
+	/// 1. 全角字符转半角，下划线修复
 	/// 2. 去除标签名中的 DSML 前缀，规范化为标准 XML 标签
 	/// 3. 转义 <parameter> 内部的 <、&、> 使其成为合法 XML
 	fn preprocess_dsml_xml(input: &str) -> String {
-	    use std::sync::OnceLock;
-	    // Step 1: 全角 → 半角
-	    let tmp = normalize_fullwidth_ascii(input);
-	    // Step 2: 规范化标签名 — 去除 DSML 前缀
-	    static RE_TAG: OnceLock<Regex> = OnceLock::new();
-	    let re_tag = RE_TAG.get_or_init(|| {
-	        Regex::new(
-	            r"<(/?)\s*\|?(?:DSML\|?)?\s*(tool_calls|invoke|parameter)((?:\s+[^>]*)?)\|?\s*>",
-	        )
-	        .unwrap()
-	    });
-	    let tmp = re_tag.replace_all(&tmp, "<$1$2$3>").to_string();
-	    // Step 3: 转义 <parameter> 内部文本中的 XML 特殊字符
+	    let tmp = input.replace('▁', "_");
+	    let tmp = normalize_dsml_tags(&tmp);
 	    escape_parameter_text(&tmp)
 	}
 	/// 转义 <parameter>...</parameter> 内部的 <、&、>
-	/// 使包含代码片段的文本内容能被标准 XML 解析器正确处理
 	fn escape_parameter_text(input: &str) -> String {
 	    use std::sync::OnceLock;
 	    static RE: OnceLock<Regex> = OnceLock::new();
@@ -705,7 +710,6 @@
 	    .into_owned()
 	}
 	/// 使用 quick-xml 解析 invoke XML 格式
-	/// 输入应已经过 preprocess_dsml_xml 预处理
 	fn parse_invoke_with_quick_xml(
 	    xml: &str,
 	    valid_tools: &HashMap<String, ToolDef>,
@@ -722,20 +726,20 @@
 	    let mut buf = Vec::new();
 	    loop {
 	        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = e.name();
-                let tag = String::from_utf8_lossy(name.as_ref());
+	            Ok(Event::Start(e)) => {
+	                let name = e.name();
+	                let tag = String::from_utf8_lossy(name.as_ref());
 	                match tag.as_ref() {
 	                    "invoke" => {
 	                        in_invoke = true;
 	                        found_invoke = true;
 	                        for attr in e.attributes().flatten() {
 	                            if attr.key.as_ref() == b"name" {
-                                tool_name = Some(
-                                    String::from_utf8_lossy(&attr.value)
-                                        .trim()
-                                        .to_string(),
-                                );
+	                                tool_name = Some(
+	                                    String::from_utf8_lossy(&attr.value)
+	                                        .trim()
+	                                        .to_string(),
+	                                );
 	                            }
 	                        }
 	                    }
@@ -744,11 +748,11 @@
 	                        current_param_name = None;
 	                        for attr in e.attributes().flatten() {
 	                            if attr.key.as_ref() == b"name" {
-                                current_param_name = Some(
-                                    String::from_utf8_lossy(&attr.value)
-                                        .trim()
-                                        .to_string(),
-                                );
+	                                current_param_name = Some(
+	                                    String::from_utf8_lossy(&attr.value)
+	                                        .trim()
+	                                        .to_string(),
+	                                );
 	                            }
 	                        }
 	                    }
@@ -766,9 +770,9 @@
 	                    }
 	                }
 	            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                let tag = String::from_utf8_lossy(name.as_ref());
+	            Ok(Event::End(e)) => {
+	                let name = e.name();
+	                let tag = String::from_utf8_lossy(name.as_ref());
 	                match tag.as_ref() {
 	                    "parameter" if in_invoke => {
 	                        if let Some(pname) = current_param_name.take() {
@@ -808,15 +812,11 @@
 	    text: &str,
 	    valid_tools: &HashMap<String, ToolDef>,
 	) -> (String, serde_json::Value) {
-    // Normalize: DeepSeek ▁(U+2581) → _(U+005F), subsequent parsing uses _ variant
-    let normalized = text.replace('▁', "_");
+	    let normalized = text.replace('▁', "_");
 	    let text = normalized.as_str();
-	    // Raw DeepSeek DSML format (fullwidth pipes ｜ U+FF5C):
-	    // <｜tool_call_begin｜>function<｜tool_sep｜>name<｜tool_call_argument_begin｜>{json}<｜tool_call_end｜>
 	    const DSML_SEP: &str = "<|tool_sep|>";
 	    const DSML_ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
 	    const DSML_CALL_END: &str = "<|tool_call_end|>";
-	    // 先做全角转半角以便匹配 DSML 内部格式
 	    let text_half = normalize_fullwidth_ascii(text);
 	    if let Some(sep_pos) = text_half.find(DSML_SEP) {
 	        let after_sep = &text_half[sep_pos + DSML_SEP.len()..];
@@ -863,16 +863,12 @@
 	            }
 	        }
 	    }
-	    // ============================================================
-	    // invoke XML: 预处理 + quick-xml 解析（替换原有手动解析）
-	    // ============================================================
 	    {
 	        let preprocessed = preprocess_dsml_xml(text);
 	        if let Some(result) = parse_invoke_with_quick_xml(&preprocessed, valid_tools) {
 	            return result;
 	        }
 	    }
-	    // DSML 格式: <tool_name>Name</tool_name><tool_arguments>{"arg":"val"}</tool_arguments>
 	    let ds_name =
 	        Regex::new(r"(?i)<[|]?(?:DSML[|]?)?tool_name[|]?>\s*([\s\S]*?)\s*(?:</[|]|$)").ok();
 	    let ds_args = Regex::new(
@@ -888,7 +884,6 @@
 	            }
 	        }
 	    }
-	    // JSON 块: {"name": "...", "arguments": {...}}
 	    if let Some(start) = text.find('{') {
 	        let mut depth = 0;
 	        let mut end = start;
@@ -917,7 +912,6 @@
 	            }
 	        }
 	    }
-	    // 按工具名匹配: <tool_name>content</tool_name>
 	    for (t_name, t_info) in valid_tools.iter() {
 	        let lower = t_name.to_lowercase();
 	        if let Some(re) = Regex::new(&format!(
