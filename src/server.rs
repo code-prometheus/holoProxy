@@ -498,6 +498,9 @@ async fn forward_raw_sse(
     triggers.insert("<｜tool_call｜>", "</｜tool_call｜>");
 
     triggers.insert("<｜invoke｜>", "</｜invoke｜>");
+    // DSML ▁ (U+2581) variants
+    triggers.insert("<｜tool▁calls▁begin｜>", "<｜tool▁call▁end｜>");
+    triggers.insert("<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>");
     triggers.insert("<DSML｜tool_name｜>", "</DSML｜tool_name｜>");
     triggers.insert("<DSML｜tool_calls｜>", "</DSML｜tool_calls｜>");
     // katakana variants
@@ -505,13 +508,14 @@ async fn forward_raw_sse(
     triggers.insert("<ツtool_callツ>", "</ツtool_callツ>");
     // invoke ASCII variant
     triggers.insert("<invoke", "</invoke>");
-    // DSML individual tool_call
     // DSML ▁(U+2581) variants — model actual output format
     // DSML begin variants
     triggers.insert("<｜tool_calls_begin｜>", "<｜tool_call_end｜>");
     triggers.insert("<｜tool_call_begin｜>", "<｜tool_call_end｜>");
     // DSML wrapper end tags (self-closing)
     triggers.insert("<｜tool_calls_end｜>", "<｜tool_calls_end｜>");
+    triggers.insert("<｜tool▁calls▁end｜>", "<｜tool▁call▁end｜>");
+    triggers.insert("<｜tool▁call▁end｜>", "<｜tool▁call▁end｜>");
     triggers.insert("<｜tool_call_end｜>", "<｜tool_call_end｜>");
 
     while let Some(chunk_result) = stream.next().await {
