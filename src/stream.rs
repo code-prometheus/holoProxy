@@ -912,7 +912,7 @@ fn parse_fallback_tool(
     text: &str,
     valid_tools: &HashMap<String, ToolDef>,
 ) -> (String, serde_json::Value) {
-    let normalized = text.replace('▁', " ");
+    let normalized = text.replace('▁', "_");
     let text = normalized.as_str();
 
     const DSML_SEP: &str = "<|tool_sep|>";
